@@ -85,7 +85,9 @@ try {
             $cookie=tempnam(sys_get_temp_dir(),'qbcat');
             if($cookie===false)throw new RuntimeException('Unable to create temporary cookie file');
             [$code,$response]=req($base.'/api/v2/auth/login','POST',http_build_query(['username'=>$qb['username']??'','password'=>$qb['password']??'']),['Content-Type: application/x-www-form-urlencoded','Referer: '.$base.'/'],'','',$cookie);
-            if($code!==200||trim($response)!=='Ok.')throw new RuntimeException('qBittorrent username/password login failed');
+            if(!(($code===204)||($code===200&&trim($response)==='Ok.'))) {
+                throw new RuntimeException('qBittorrent username/password login failed (HTTP '.$code.', response '.($code===200?'not Ok.':'unexpected').')');
+            }
             $categories=qbget($base,'torrents/categories',$cookie);
             $torrents=qbget($base,'torrents/info?filter=all',$cookie);
             logmsg('qBittorrent authentication: username/password');
