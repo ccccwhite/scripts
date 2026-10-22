@@ -20,10 +20,10 @@ function qbList(array $cfg): array {
     $request=function(string $path,array $headers=[])use($base,$cookie){
         $c=curl_init($base.'/api/v2/'.$path);
         curl_setopt_array($c,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_TIMEOUT=>30,CURLOPT_CONNECTTIMEOUT=>7,
-            CURLOPT_COOKIEJAR=>$cookie,CURLOPT_COOKIEFILE=>$cookie,CURLOPT_HTTPHEADER=>array_merge(['Referer: '.$base.'/'], $headers),
+            CURLOPT_COOKIEFILE=>$cookie,CURLOPT_HTTPHEADER=>array_merge(['Referer: '.$base.'/'], $headers),
             CURLOPT_PROXY=>'',CURLOPT_NOPROXY=>'*']);
         $body=curl_exec($c);$status=(int)curl_getinfo($c,CURLINFO_HTTP_CODE);$err=curl_error($c);curl_close($c);
-        if($body===false||$status!==200)throw new RuntimeException("qBittorrent HTTP $status $err");
+        if($body===false||$status!==200)throw new RuntimeException("qBittorrent torrent list HTTP $status $err");
         $result=json_decode($body,true,512,JSON_THROW_ON_ERROR);
         if(!is_array($result))throw new RuntimeException('Unexpected qBit response');
         return $result;
