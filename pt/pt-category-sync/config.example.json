@@ -1,15 +1,4 @@
 {
-  "qbittorrent": {
-    "url": "http://127.0.0.1:8080",
-    "username": "admin",
-    "password": "",
-    "api_key": ""
-  },
-  "transmission": {
-    "rpc_url": "http://127.0.0.1:9091/transmission/rpc",
-    "username": "",
-    "password": ""
-  },
   "dry_run": true,
   "use_cache": true,
   "only_current_qbit_categories": false,
@@ -19,5 +8,6 @@
   "tracker_domain_rules": {
     "NicePT": [],
     "Rousi": []
-  }
+  },
+  "credentials_file": "/boot/config/plugins/user.scripts/pt-common/credentials.json"
 }
