@@ -53,6 +53,32 @@ function qwrite(array $qb,string $endpoint,array $form,?string $cookie,array $he
     if($status!==200&&$status!==204)throw new RuntimeException('qBittorrent write '.$endpoint.' HTTP '.$status);
 }
 function pathsOverlap(string $a,string $b): bool {return within($a,$b)||within($b,$a);}
+function inferSite(array $t,array $qitems,array $cfg): array {
+    $ssd=norm($cfg['ssd_path']);$hdd=norm($cfg['hdd_path']);
+    $dir=norm((string)($t['download_dir']??'/'));
+    $candidates=[];
+    // A first-level directory below the storage root is the strongest site hint.
+    foreach([$ssd,$hdd] as $root){
+        if(within($dir,$root)&&$dir!==$root){
+            $relative=trim(substr($dir,strlen($root)),'/');
+            $part=explode('/',$relative)[0];
+            if(preg_match('/^[a-zA-Z0-9_-]+$/',$part))$candidates[strtolower($part)]=true;
+        }
+    }
+    $hash=strtolower((string)($t['hash_string']??''));
+    $ignored=array_map('strtolower',[$cfg['ssd_label'],$cfg['hdd_label'],$cfg['move_label']]);
+    foreach((array)($t['labels']??[]) as $label){
+        $v=strtolower(trim((string)$label));
+        if($v!==''&&!in_array($v,$ignored,true)&&!str_contains($v,':')&&preg_match('/^[a-z0-9_-]+$/',$v))$candidates[$v]=true;
+    }
+    foreach($qitems as $q){
+        if(strtolower((string)($q['hash']??''))!==$hash)continue;
+        $category=strtolower(trim((string)($q['category']??'')));
+        if($category!==''&&preg_match('/^[a-z0-9_-]+$/',$category))$candidates[$category]=true;
+    }
+    if(count($candidates)!==1)return [null,'site ambiguous or missing: '.implode(',',array_keys($candidates))];
+    return [array_key_first($candidates),null];
+}
 function saveState(string $path,array $state): void {
     $tmp=tempnam(dirname($path),'.storage-');
     if($tmp===false)throw new RuntimeException('Cannot create state file');
@@ -177,10 +203,8 @@ try {
             if($loc===null)$reason='unrecognized storage';
             elseif($loc==='hdd')$reason='already HDD';
             elseif((float)($t['percent_done']??0)<0.999999)$reason='not completed';
-            $sites=[];
-            foreach($cfg['site_labels'] as $site)foreach($old as $label)if(strcasecmp((string)$site,$label)===0)$sites[strtolower((string)$site)]=true;
-            if(count($sites)!==1)$reason='site label missing or ambiguous';
-            $site=array_key_first($sites);
+            [$site,$siteError]=inferSite($t,$qitems,$cfg);
+            if($siteError!==null)$reason=$siteError;
             $files=[];$invalid=false;
             foreach(($t['files']??[]) as $f) {
                 $fn=(string)($f['name']??'');
