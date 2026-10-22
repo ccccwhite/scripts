@@ -53,6 +53,27 @@ function qwrite(array $qb,string $endpoint,array $form,?string $cookie,array $he
     if($status!==200&&$status!==204)throw new RuntimeException('qBittorrent write '.$endpoint.' HTTP '.$status);
 }
 function pathsOverlap(string $a,string $b): bool {return within($a,$b)||within($b,$a);}
+function saveState(string $path,array $state): void {
+    $tmp=tempnam(dirname($path),'.storage-');
+    if($tmp===false)throw new RuntimeException('Cannot create state file');
+    chmod($tmp,0600);
+    file_put_contents($tmp,json_encode($state,JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR)."\n");
+    if(!rename($tmp,$path))throw new RuntimeException('Cannot save state');
+}
+function verifyDestination(array $torrent,array $pending,array $cfg): array {
+    $dest=norm($pending['destination']);
+    if(norm((string)($torrent['download_dir']??'/'))!==$dest)return [false,'save path not updated'];
+    $files=(array)($torrent['files']??[]);
+    if(!$files)return [false,'empty file list'];
+    foreach($files as $f){
+        $name=(string)($f['name']??'');
+        if($name===''||str_starts_with($name,'/')||preg_match('~(^|/)\.\.(/|$)~',$name))return [false,'unsafe file name'];
+        $path=rtrim($cfg['hdd_host_path'],'/').substr($dest,strlen(norm($cfg['hdd_path']))).'/'.$name;
+        if(!is_file($path))return [false,'missing file: '.$name];
+        if(filesize($path)!==(int)($f['length']??-1))return [false,'size mismatch: '.$name];
+    }
+    return [true,'path and file sizes confirmed'];
+}
 try {
     if(!extension_loaded('curl'))throw new RuntimeException('PHP cURL required');
     $configFile=$argv[1]??__DIR__.'/config.json';
@@ -64,6 +85,8 @@ try {
     $dry=(bool)($cfg['dry_run']??true);$moveEnabled=(bool)($cfg['enable_move']??false);
     $ssd=norm($cfg['ssd_path']);$hdd=norm($cfg['hdd_path']);
     if($ssd===$hdd||$ssd==='/'||$hdd==='/')throw new RuntimeException('Unsafe storage roots');
+    $statePath=$cfg['state_file']??dirname($configFile).'/state.json';
+    $state=is_file($statePath)?jsonArr((string)file_get_contents($statePath)):[];
     $session='';$cookie=null;$headers=[];
     $qKey=trim((string)($qb['api_key']??''));
     try {
@@ -79,7 +102,7 @@ try {
             if(!($status===204||($status===200&&trim($body)==='Ok.')))throw new RuntimeException('qBittorrent login failed: '.$status);
             $qitems=qreq($qb,'torrents/info?filter=all',$cookie,[]);
         }
-        $titems=rpc($tr,'torrent_get',['fields'=>['id','hash_string','name','labels','download_dir','percent_done','files','status']],$session)['torrents']??[];
+        $titems=rpc($tr,'torrent_get',['fields'=>['id','hash_string','name','labels','download_dir','percent_done','files','status','error','error_string']],$session)['torrents']??[];
         say('qBittorrent '.count($qitems).', Transmission '.count($titems).', mode '.($dry?'DRY RUN':'WRITE').', move '.($moveEnabled?'enabled':'disabled'));
         $qpaths=[];$qchanges=0;$tchanges=0;$candidates=0;
         foreach($qitems as $q) {
@@ -119,6 +142,28 @@ try {
             $id=(int)$t['id'];$hash=strtolower((string)($t['hash_string']??''));$name=(string)($t['name']??'');
             $dir=norm((string)($t['download_dir']??'/'));$loc=location($dir,$ssd,$hdd);
             $old=array_values(array_filter((array)($t['labels']??[]),'is_string'));
+            if(isset($state[$hash])){
+                [$ok,$message]=verifyDestination($t,$state[$hash],$cfg);
+                if($ok){
+                    $fixed=array_values(array_unique(array_merge(array_values(array_diff($old,[$cfg['move_label'],$cfg['ssd_label'],$cfg['hdd_label']])),[$cfg['hdd_label']])));
+                    say(($dry?'PREVIEW COMPLETE':'COMPLETE').' '.substr($hash,0,12).' : '.$message);
+                    if(!$dry){
+                        if(!sameSet($old,$fixed))rpc($tr,'torrent_set',['ids'=>[$id],'labels'=>$fixed],$session);
+                        unset($state[$hash]);saveState($statePath,$state);
+                    }
+                }else{
+                    $err=(int)($t['error']??0);
+                    say('PENDING '.substr($hash,0,12).' : '.$message.'; status='.(string)($t['status']??'?').'; error='.$err);
+                    if($err!==0&&empty($state[$hash]['verify_requested'])){
+                        say(($dry?'PREVIEW VERIFY':'VERIFY').' '.substr($hash,0,12).' : '.(string)($t['error_string']??''));
+                        if(!$dry){
+                            rpc($tr,'torrent_verify',['ids'=>[$id]],$session);
+                            $state[$hash]['verify_requested']=true;saveState($statePath,$state);
+                        }
+                    }
+                }
+                continue;
+            }
             $new=changeLabels($old,$loc,$cfg);
             if($loc===null)say('WARN Transmission '.substr($hash,0,12).' outside storage; skip labels');
             elseif(!sameSet($old,$new)){
@@ -171,10 +216,12 @@ try {
             if($mount!==$host)throw new RuntimeException('HDD is not mounted at '.$host);
             if(!is_dir($host.'/'.$folder)&&!mkdir($host.'/'.$folder,0775,true)&&!is_dir($host.'/'.$folder))throw new RuntimeException('Cannot create site directory');
             // Transmission RPC move=true moves data and changes its download directory.
+            $state[$hash]=['destination'=>$dest,'source'=>$dir,'requested_at'=>date(DATE_ATOM),'verify_requested'=>false];
+            saveState($statePath,$state);
             rpc($tr,'torrent_set_location',['ids'=>[$id],'location'=>$dest,'move'=>true],$session);
-            say('MOVE REQUESTED '.$hash.' ; keep move:hdd until next verified run');
+            say('MOVE REQUESTED '.$hash.' ; check again on next run');
         }
         say('Summary: qBit label changes '.$qchanges.', Transmission label changes '.$tchanges.', marked move candidates '.$candidates);
-        say('Note: move:hdd is never auto-cleared in this initial safety version; verify completed moves first.');
+        say('Pending moves: '.count($state).'; file size checks are not full hash verification.');
     } finally {if($cookie!==null)@unlink($cookie);}
 } catch(Throwable $e){fwrite(STDERR,'ERROR: '.$e->getMessage().PHP_EOL);exit(1);}
