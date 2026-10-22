@@ -15,3 +15,12 @@ qBittorrent 站点分类 → Transmission 4.1.3 标签。支持相同 Info Hash 
 - 如果 IYUU 在第一次脚本执行前删除 qBittorrent 源任务，可能无法恢复分类映射。
 
 依赖：Unraid 宿主机 PHP 及 cURL 扩展、qBittorrent Web API、Transmission 4.1 JSON-RPC。
+
+## qBittorrent 认证方式
+
+在本地 `config.json` 的 `qbittorrent` 部分设置 `auth_mode`：
+
+- `password`：使用 `username` 与 `password` 登录并获取 Cookie。
+- `api_key`：使用 qBittorrent 5.2.4 的 `api_key`，发送 Bearer 认证请求；此模式不需要填写用户名和密码。
+
+Transmission 4.1.3 继续使用自身配置的用户名/密码进行 RPC HTTP 认证。不要将含凭据的 `config.json` 提交到仓库。
