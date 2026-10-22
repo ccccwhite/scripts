@@ -1,0 +1,6 @@
+# Private client configuration and runtime files
+**/config.json
+**/cache.json
+**/run.lock
+**/*.log
+.DS_Store
