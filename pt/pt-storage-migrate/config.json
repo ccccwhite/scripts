@@ -9,9 +9,9 @@
   "ssd_label": "storage:ssd",
   "hdd_label": "storage:hdd",
   "site_labels": [
-    "NicePT",
-    "Rousi",
-    "HappyFappy"
+    "nicept",
+    "rousi",
+    "happyfappy"
   ],
   "site_folder_case": "lower"
 }
