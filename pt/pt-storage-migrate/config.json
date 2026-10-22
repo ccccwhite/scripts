@@ -1,0 +1,17 @@
+{
+  "dry_run": true,
+  "enable_move": false,
+  "credentials_file": "/boot/config/plugins/user.scripts/pt-common/credentials.json",
+  "ssd_path": "/temp",
+  "hdd_path": "/hdd",
+  "hdd_host_path": "/mnt/disk3",
+  "move_label": "move:hdd",
+  "ssd_label": "storage:ssd",
+  "hdd_label": "storage:hdd",
+  "site_labels": [
+    "NicePT",
+    "Rousi",
+    "HappyFappy"
+  ],
+  "site_folder_case": "lower"
+}
