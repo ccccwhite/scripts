@@ -76,3 +76,11 @@ bash "$BASE/script"
 - 无法可靠识别存储位置的种子不会强制补标签。
 - 当前初版使用 Transmission RPC 发起迁移，但**不会自动移除 `move:hdd` 标签**；需要先验证文件迁移及任务状态，再完善迁移完成确认。
 - 暂不建议启用定时自动迁移；先手动测试。
+
+## 路径命名约定
+
+- 站点标签统一小写：`nicept`、`rousi`、`happyfappy`。
+- SSD 下载站点目录统一小写：容器 `/temp/nicept/`，宿主机 `/mnt/download/nicept/`。
+- HDD 迁移站点目录统一小写：容器 `/hdd/nicept/`，宿主机 `/mnt/disk3/nicept/`。
+- 本脚本只负责存储标签同步和 Transmission HDD 迁移；**不会自动修改 qBittorrent 的下载保存路径**。直接下载到 HDD 或 SSD 时，需要在下载器的分类/保存路径设置中使用小写目录。
+- 不会强制重命名已有目录、种子文件名或内容，避免破坏做种。
