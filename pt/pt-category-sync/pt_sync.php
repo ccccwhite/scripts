@@ -60,25 +60,36 @@ try {
         $read=asjson((string)file_get_contents($cachePath));
         $cache=array_merge($cache,$read);
     }
-    $mode=$qb['auth_mode']??'password';
-    if(!in_array($mode,['password','api_key'],true))throw new RuntimeException('Invalid qbittorrent auth_mode');
     $cookie=null;$authHeaders=[];
-    if($mode==='api_key'){
-        $key=trim((string)($qb['api_key']??''));
-        if(!preg_match('/^qbt_[A-Za-z0-9]{28}$/',$key))throw new RuntimeException('Invalid qBittorrent API key format');
-        $authHeaders=['Authorization: Bearer '.$key];
-    } else {
-        $cookie=tempnam(sys_get_temp_dir(),'qbcat');
-        if($cookie===false)throw new RuntimeException('Unable to create temporary cookie file');
-    }
+    $key=trim((string)($qb['api_key']??''));
+    $hasPassword=(string)($qb['username']??'')!=='' && (string)($qb['password']??'')!=='';
+    if($key===''&&!$hasPassword)throw new RuntimeException('Please configure qBittorrent api_key or username/password');
+    $base=rtrim($qb['url'],'/');
     try {
-        if($mode==='password'){
-            $base=rtrim($qb['url'],'/');
-            [$code,$response]=req($base.'/api/v2/auth/login','POST',http_build_query(['username'=>$qb['username']??'','password'=>$qb['password']??'']),['Content-Type: application/x-www-form-urlencoded','Referer: '.$base.'/'],'','',$cookie);
-            if($code!==200||trim($response)!=='Ok.')throw new RuntimeException('qBittorrent authentication failed');
+        $authenticated=false;
+        if($key!==''){
+            // Prefer API key. Verify it by reading categories before proceeding.
+            try {
+                $authHeaders=['Authorization: Bearer '.$key];
+                $categories=qbget($base,'torrents/categories',null,$authHeaders);
+                $torrents=qbget($base,'torrents/info?filter=all',null,$authHeaders);
+                $authenticated=true;
+                logmsg('qBittorrent authentication: API key');
+            } catch(Throwable $apiError) {
+                if(!$hasPassword)throw new RuntimeException('API key authentication failed: '.$apiError->getMessage());
+                logmsg('qBittorrent API key unsuccessful; falling back to username/password');
+                $authHeaders=[];
+            }
         }
-        $categories=qbget($qb['url'],'torrents/categories',$cookie,$authHeaders);
-        $torrents=qbget($qb['url'],'torrents/info?filter=all',$cookie,$authHeaders);
+        if(!$authenticated){
+            $cookie=tempnam(sys_get_temp_dir(),'qbcat');
+            if($cookie===false)throw new RuntimeException('Unable to create temporary cookie file');
+            [$code,$response]=req($base.'/api/v2/auth/login','POST',http_build_query(['username'=>$qb['username']??'','password'=>$qb['password']??'']),['Content-Type: application/x-www-form-urlencoded','Referer: '.$base.'/'],'','',$cookie);
+            if($code!==200||trim($response)!=='Ok.')throw new RuntimeException('qBittorrent username/password login failed');
+            $categories=qbget($base,'torrents/categories',$cookie);
+            $torrents=qbget($base,'torrents/info?filter=all',$cookie);
+            logmsg('qBittorrent authentication: username/password');
+        }
         logmsg('qBittorrent: '.count($categories).' categories, '.count($torrents).' torrents');
         $valid=array_fill_keys(array_keys($categories),true);
         $learn=[];$hashMap=[];$max=max(0,(int)($cfg['max_qbit_tracker_lookups']??500));$calls=0;
