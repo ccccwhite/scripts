@@ -13,43 +13,96 @@ function mergeCredentials(array $cfg): array {
     }
     return $cfg;
 }
+function req(string $url, string $method='GET', ?string $data=null, array $headers=[], string $user='', string $pass='', ?string $cookie=null): array {
+    $c=curl_init($url); $rh=[];
+    curl_setopt_array($c,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_CONNECTTIMEOUT=>7,CURLOPT_TIMEOUT=>30,CURLOPT_CUSTOMREQUEST=>$method,CURLOPT_HTTPHEADER=>$headers,CURLOPT_FOLLOWLOCATION=>false,CURLOPT_PROXY=>'',CURLOPT_NOPROXY=>'*',CURLOPT_HEADERFUNCTION=>function($ch,$line)use(&$rh){$i=strpos($line,':');if($i!==false)$rh[strtolower(trim(substr($line,0,$i)))]=trim(substr($line,$i+1));return strlen($line);}]);
+    if($data!==null)curl_setopt($c,CURLOPT_POSTFIELDS,$data);
+    if($user!=='')curl_setopt($c,CURLOPT_USERPWD,$user.':'.$pass);
+    if($cookie!==null){curl_setopt($c,CURLOPT_COOKIEJAR,$cookie);curl_setopt($c,CURLOPT_COOKIEFILE,$cookie);}
+    $body=curl_exec($c);$status=(int)curl_getinfo($c,CURLINFO_HTTP_CODE);$err=curl_error($c);curl_close($c);
+    if($body===false)throw new RuntimeException('HTTP request failed: '.$err);
+    return [$status,(string)$body,$rh];
+}
+function asjson(string $s): array { $a=json_decode($s,true);if(!is_array($a))throw new RuntimeException('Invalid JSON');return $a; }
+function qbget(string $base,string $endpoint,?string $cookie,array $authHeaders=[]): array {
+    [$code,$data]=req(rtrim($base,'/').'/api/v2/'.$endpoint,'GET',null,$authHeaders,'','',$cookie);
+    if($code!==200)throw new RuntimeException('qBittorrent API '.$endpoint.' HTTP '.$code);
+    return asjson($data);
+}
 function qbList(array $cfg): array {
-    $base=rtrim($cfg['url'],'/');
-    $cookie=tempnam(sys_get_temp_dir(),'qbact');
-    if($cookie===false)throw new RuntimeException('Cookie file unavailable');
-    $request=function(string $path,array $headers=[])use($base,$cookie){
-        $c=curl_init($base.'/api/v2/'.$path);
-        curl_setopt_array($c,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_TIMEOUT=>30,CURLOPT_CONNECTTIMEOUT=>7,
-            CURLOPT_COOKIEFILE=>$cookie,CURLOPT_HTTPHEADER=>array_merge(['Referer: '.$base.'/'], $headers),
-            CURLOPT_PROXY=>'',CURLOPT_NOPROXY=>'*']);
-        $body=curl_exec($c);$status=(int)curl_getinfo($c,CURLINFO_HTTP_CODE);$err=curl_error($c);curl_close($c);
-        if($body===false||$status!==200)throw new RuntimeException("qBittorrent torrent list HTTP $status $err");
-        $result=json_decode($body,true,512,JSON_THROW_ON_ERROR);
-        if(!is_array($result))throw new RuntimeException('Unexpected qBit response');
-        return $result;
-    };
+    $base = rtrim($cfg['url'], '/');
+    $cookie = null;
+    $headers = [];
+
+    $key = trim((string)($cfg['api_key'] ?? ''));
+    $hasPassword = !empty($cfg['username']) &&
+                   !empty($cfg['password']);
+
     try {
-        $apiKey=trim((string)($cfg['api_key']??''));
-        if($apiKey!==''){
-            try{return $request('torrents/info?filter=all',['Authorization: Bearer '.$apiKey]);}
-            catch(Throwable $e){
-                if(empty($cfg['username'])||empty($cfg['password']))throw $e;
-                echo "API Key unavailable; using qBittorrent password\n";
+        if ($key !== '') {
+            try {
+                $headers = ['Authorization: Bearer '.$key];
+
+                qbget($base, 'torrents/categories', null, $headers);
+
+                return qbget(
+                    $base,
+                    'torrents/info?filter=all',
+                    null,
+                    $headers
+                );
+            } catch (Throwable $e) {
+                if (!$hasPassword) throw $e;
+                $headers = [];
             }
         }
-        if(empty($cfg['username'])||empty($cfg['password']))throw new RuntimeException('qBittorrent credentials missing');
-        $c=curl_init($base.'/api/v2/auth/login');
-        curl_setopt_array($c,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_POST=>true,
-            CURLOPT_POSTFIELDS=>http_build_query(['username'=>$cfg['username'],'password'=>$cfg['password']]),
-            CURLOPT_HTTPHEADER=>['Content-Type: application/x-www-form-urlencoded','Referer: '.$base.'/'],
-            CURLOPT_COOKIEJAR=>$cookie,CURLOPT_COOKIEFILE=>$cookie,CURLOPT_TIMEOUT=>30,CURLOPT_CONNECTTIMEOUT=>7,
-            CURLOPT_PROXY=>'',CURLOPT_NOPROXY=>'*']);
-        $body=curl_exec($c);$status=(int)curl_getinfo($c,CURLINFO_HTTP_CODE);curl_close($c);
-        if($body===false||!(($status===204)||($status===200&&trim($body)==='Ok.')))
-            throw new RuntimeException("qBittorrent login failed (HTTP $status)");
-        return $request('torrents/info?filter=all');
-    }finally{@unlink($cookie);}
+
+        if (!$hasPassword) {
+            throw new RuntimeException('qBittorrent credentials missing');
+        }
+
+        $cookie = tempnam(sys_get_temp_dir(), 'qbcat');
+
+        [$status, $response] = req(
+            $base.'/api/v2/auth/login',
+            'POST',
+            http_build_query([
+                'username' => $cfg['username'],
+                'password' => $cfg['password']
+            ]),
+            [
+                'Content-Type: application/x-www-form-urlencoded',
+                'Referer: '.$base.'/'
+            ],
+            '',
+            '',
+            $cookie
+        );
+
+        if (!(
+            $status === 204 ||
+            ($status === 200 && trim($response) === 'Ok.')
+        )) {
+            throw new RuntimeException(
+                'qBittorrent login HTTP '.$status
+            );
+        }
+
+        qbget($base, 'torrents/categories', $cookie);
+
+        return qbget(
+            $base,
+            'torrents/info?filter=all',
+            $cookie
+        );
+
+    } finally {
+        if ($cookie !== null) {
+            @unlink($cookie);
+        }
+    }
 }
+
 function rpc(array $cfg): array {
     $url=$cfg['rpc_url']; $session='';
     $payload=json_encode(['jsonrpc'=>'2.0','id'=>1,'method'=>'torrent_get',
