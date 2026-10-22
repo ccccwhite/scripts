@@ -1,7 +1,6 @@
 {
   "qbittorrent": {
     "url": "http://127.0.0.1:8080",
-    "auth_mode": "password",
     "username": "admin",
     "password": "",
     "api_key": ""
