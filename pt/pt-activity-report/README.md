@@ -10,7 +10,7 @@
 
 ## 安装
 
-将 `pt_activity.php` 与模板下载到 `/boot/config/plugins/user.scripts/pt-activity-report/`，模板保存为 `config.json`，填写地址与认证信息。将 `script` 内容填入 Unraid User Scripts，先手动测试，再设定 Cron `10 3 * * *`。
+将 `pt_activity.php` 与模板下载到 `/boot/config/plugins/user.scripts/pt-activity-report/`，模板保存为 `config.json`，在 pt-common/credentials.json 中填写认证信息，并在本脚本 config.json 中设置 credentials_file。兼容原有在 config.json 内直接设置账号的模式。将 `script` 内容填入 Unraid User Scripts，先手动测试，再设定 Cron `10 3 * * *`。
 
 `hr_rules` 中 0 表示规则未配置，禁止视为达标。规则须自行依据站点政策核实。无需提交 `config.json`、`state.json`、`report.csv` 等运行文件。
 
