@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+BASE="/boot/config/plugins/user.scripts/pt-category-sync"
+mkdir -p "$BASE"
+exec 9>"$BASE/run.lock"
+if ! flock -n 9; then
+  echo "PT 分类同步正在运行，跳过本次任务"
+  exit 0
+fi
+exec /usr/bin/php "$BASE/pt_sync.php" "$BASE/config.json"
