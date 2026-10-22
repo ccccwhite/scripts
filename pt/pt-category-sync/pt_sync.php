@@ -1,6 +1,18 @@
 <?php
 /** qBittorrent category -> Transmission 4.1 tags; Unraid PHP + cURL */
 declare(strict_types=1);
+function mergeCredentials(array $cfg): array {
+    $path=$cfg['credentials_file']??null;
+    if($path===null||$path==='')return $cfg; // Backward-compatible existing config.
+    if(!is_string($path)||!is_file($path)||!is_readable($path))throw new RuntimeException('Shared credentials file not readable: '.(string)$path);
+    $cred=json_decode((string)file_get_contents($path),true,512,JSON_THROW_ON_ERROR);
+    if(!is_array($cred))throw new RuntimeException('Invalid shared credentials JSON');
+    foreach(['qbittorrent','transmission'] as $name){
+        if(!isset($cred[$name])||!is_array($cred[$name]))throw new RuntimeException('Shared credentials missing: '.$name);
+        $cfg[$name]=$cred[$name];
+    }
+    return $cfg;
+}
 function logmsg(string $m): void { echo '['.date('Y-m-d H:i:s').'] '.$m.PHP_EOL; }
 function req(string $url, string $method='GET', ?string $data=null, array $headers=[], string $user='', string $pass='', ?string $cookie=null): array {
     $c=curl_init($url); $rh=[];
@@ -51,7 +63,7 @@ function matchRule(string $host,array $rules): array {
 try {
     if(!extension_loaded('curl'))throw new RuntimeException('PHP curl extension required');
     $path=$argv[1]??__DIR__.'/config.json';
-    $cfg=asjson((string)file_get_contents($path));
+    $cfg=mergeCredentials(asjson((string)file_get_contents($path)));
     $qb=$cfg['qbittorrent'];$tr=$cfg['transmission'];
     $dry=(bool)($cfg['dry_run']??true);
     $cachePath=$cfg['cache_file']??dirname($path).'/cache.json';
