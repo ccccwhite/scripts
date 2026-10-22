@@ -1,0 +1,20 @@
+{
+  "timezone": "Asia/Shanghai",
+  "inactive_days": 30,
+  "minimum_upload_bytes": 0,
+  "state_file": "/boot/config/plugins/user.scripts/pt-activity-report/state.json",
+  "csv_file": "/boot/config/plugins/user.scripts/pt-activity-report/report.csv",
+  "hr_rules": {
+    "nicept": {
+      "min_seeding_hours": 0,
+      "min_ratio": 0,
+      "logic": "all"
+    },
+    "happyfappy": {
+      "min_seeding_hours": 0,
+      "min_ratio": 0,
+      "logic": "all"
+    }
+  },
+  "credentials_file": "/boot/config/plugins/user.scripts/pt-common/credentials.json"
+}
