@@ -17,34 +17,51 @@ while (($values = fgetcsv($stream)) !== false) {
 fclose($stream);
 function esc($v): string { return htmlspecialchars((string)$v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
 function getv(array $r, string $key): string { return (string)($r[$key] ?? ''); }
-$rows = '';
-foreach ($records as $r) {
-    $name=getv($r,'种子名称');
+// Merge only identical Info Hash values. Keep separate clients in details.
+$groups=[];
+foreach($records as $r){
+    $hash=strtolower(trim(getv($r,'Hash')));
     $site=getv($r,'站点');
-    $client=getv($r,'下载器');
-    $inactive=getv($r,'未观察到上传天数');
-    $hours=getv($r,'同站同Hash合计做种小时');
-    $ratio=getv($r,'同站同Hash合计分享率估算');
-    $hr=getv($r,'H&R本地估算');
-    $nameHtml=esc($name);
-    $detail = '<details><summary title="展开详情">'.$nameHtml.'</summary><div class="details">'
-        .'<div><b>Hash：</b><code>'.esc(getv($r,'Hash')).'</code></div>'
-        .'<div><b>保存路径：</b>'.esc(getv($r,'保存路径')).'</div>'
-        .'<div><b>标签：</b>'.esc(getv($r,'分类或标签')).'</div>'
-        .'<div><b>当前客户端做种：</b>'.esc(getv($r,'本客户端做种小时')).' 小时</div>'
-        .'<div><b>当前客户端分享率：</b>'.esc(getv($r,'本客户端分享率')).'</div>'
-        .'<div><b>累计上传字节：</b>'.esc(getv($r,'累计上传字节')).'</div>'
-        .'<div><b>最近传输活动：</b>'.esc(getv($r,'最近数据传输时间')).'</div>'
-        .'<div><b>状态：</b>'.esc(getv($r,'状态说明')).'</div>'
-        .'</div></details>';
-    $rows.='<tr><td>'.esc($site).'</td><td>'.esc($client).'</td><td class="name">'.$detail.'</td>'
-        .'<td data-sort="'.esc(is_numeric($inactive)?$inactive:-1).'">'.esc($inactive).'</td>'
+    $key=$hash!=='' ? $site.'|'.$hash : $site.'|'.getv($r,'下载器').'|'.getv($r,'种子名称');
+    $groups[$key][]=$r;
+}
+$rows='';
+foreach($groups as $items){
+    $first=$items[0];
+    $site=getv($first,'站点');
+    $name=getv($first,'种子名称');
+    $clients=array_values(array_unique(array_map(fn($r)=>getv($r,'下载器'),$items)));
+    $hours=getv($first,'同站同Hash合计做种小时');
+    $ratio=getv($first,'同站同Hash合计分享率估算');
+    $hr=getv($first,'H&R本地估算');
+    $activity='';
+    $details='';
+    foreach($items as $r){
+        $dt=getv($r,'最近数据传输时间');
+        if($dt!=='' && $dt!=='未知' && $dt>$activity)$activity=$dt;
+        $details.='<section><b>'.esc(getv($r,'下载器')).'</b>'
+            .'<div>做种：'.esc(getv($r,'本客户端做种小时')).' 小时 · 分享率：'.esc(getv($r,'本客户端分享率')).'</div>'
+            .'<div>累计上传：'.esc(getv($r,'累计上传字节')).' 字节</div>'
+            .'<div>最近活动：'.esc($dt).'</div>'
+            .'<div>路径：'.esc(getv($r,'保存路径')).'</div>'
+            .'<div>标签：'.esc(getv($r,'分类或标签')).'</div>'
+            .'</section>';
+    }
+    $details.='<div>Hash：<code>'.esc(getv($first,'Hash')).'</code></div>';
+    $detail='<details><summary>'.esc($name).'</summary><div class="details">'.$details.'</div></details>';
+    $rows.='<tr><td>'.esc($site).'</td><td>'.esc(implode(' + ',$clients)).'</td><td class="name">'.$detail.'</td>'
+        .'<td data-sort="'.esc($activity).'">'.esc($activity?:'未知').'</td>'
         .'<td data-sort="'.esc(is_numeric($hours)?$hours:-1).'">'.esc($hours).'</td>'
         .'<td data-sort="'.esc(is_numeric($ratio)?$ratio:-1).'">'.esc($ratio).'</td>'
-        .'<td>'.esc($hr).'</td></tr>' . "\n";
+        .'<td>'.esc($hr).'</td></tr>'."\n";
 }
+$taskCount=count($records);
+$uniqueCount=count($groups);
+$clientCounts=[];
+foreach($records as $r){$c=getv($r,'下载器');$clientCounts[$c]=($clientCounts[$c]??0)+1;}
+$clientSummary=implode(' · ',array_map(fn($c,$n)=>$c.': '.$n,array_keys($clientCounts),array_values($clientCounts)));
 $updated=esc((new DateTimeImmutable('now', new DateTimeZone('Asia/Shanghai')))->format('Y-m-d H:i:s'));
-$count=count($records);
+$count=$uniqueCount;
 $page=<<<'HTML'
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -58,11 +75,11 @@ tr:last-child td{border-bottom:0}tbody tr:hover{background:#8881}.name{min-width
 .details{color:gray;padding:10px 0 2px;font-size:12px;line-height:1.9;overflow-wrap:anywhere}.details code{font-size:11px;white-space:normal}
 .note{font-size:12px;margin-top:16px}#visible{font-variant-numeric:tabular-nums}
 </style></head><body>
-<header><div><h1>PT 种子活跃度</h1><p>更新：__UPDATED__ · 共 __COUNT__ 条下载器任务 · 显示 <span id="visible">__COUNT__</span> 条</p></div>
+<header><div><h1>PT 种子活跃度</h1><p>更新：__UPDATED__ · 共 __COUNT__ 个不同种子 · __TASKCOUNT__ 条下载器任务 · 显示 <span id="visible">__COUNT__</span> 条<br>__CLIENTSUMMARY__</p></div>
 <input id="search" type="search" placeholder="搜索站点、种子名、下载器或 H&R 状态…"></header>
-<div class="wrapper"><table id="report"><thead><tr><th>站点</th><th>下载器</th><th>种子名称 / 详情</th><th>未上传（天）</th><th>合计做种（小时）</th><th>合计分享率</th><th>H&R 本地评估</th></tr></thead>
+<div class="wrapper"><table id="report"><thead><tr><th>站点</th><th>下载器</th><th>种子名称 / 详情</th><th>最近活动</th><th>合计做种（小时）</th><th>合计分享率</th><th>H&R 本地评估</th></tr></thead>
 <tbody>__ROWS__</tbody></table></div>
-<p class="note">未上传时长从首次采样后逐步建立；“未知”不代表 0 天。同站同 Hash 合计值是本地客户端统计，不等于 PT 站点最终 H&R 判定。点击表头排序，点击种子名称展开详情。</p>
+<p class="note">相同站点与 Info Hash 的任务合并成一行；最近活动不一定代表实际上传。合计做种时间可能包含两个客户端的重叠时间。合计分享率是本地估算，H&R 不代表站点判定。点击表头排序，点击种子名称展开详情。</p>
 <script>
 const table=document.getElementById('report'), rows=[...table.tBodies[0].rows],search=document.getElementById('search');
 let sortColumn=3,sortAsc=false;
@@ -70,9 +87,9 @@ function redraw(){const q=search.value.trim().toLocaleLowerCase();const shown=ro
 [...table.tHead.rows[0].cells].forEach((th,i)=>th.addEventListener('click',()=>{sortAsc=sortColumn===i?!sortAsc:true;sortColumn=i;redraw()}));search.addEventListener('input',redraw);redraw();
 </script></body></html>
 HTML;
-$page=str_replace(['__UPDATED__','__COUNT__','__ROWS__'],[$updated,(string)$count,$rows],$page);
+$page=str_replace(['__UPDATED__','__COUNT__','__TASKCOUNT__','__CLIENTSUMMARY__','__ROWS__'],[$updated,(string)$count,(string)$taskCount,esc($clientSummary),$rows],$page);
 $tmp=$htmlPath.'.tmp';
 if(file_put_contents($tmp,$page)===false){fwrite(STDERR,"Cannot write report HTML\n");exit(1);}
 chmod($tmp,0600);
 if(!rename($tmp,$htmlPath)){fwrite(STDERR,"Cannot replace report HTML\n");exit(1);}
-echo "HTML 报表: $htmlPath ($count 条任务)\n";
+echo "HTML 报表: $htmlPath ($count 个不同种子，$taskCount 条下载器任务)\n";
