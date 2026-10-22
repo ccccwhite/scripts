@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+BASE="/boot/config/plugins/user.scripts/pt-activity-report"
+exec 9>"$BASE/run.lock"
+flock -n 9 || { echo "已有报表任务正在运行"; exit 0; }
+exec /usr/bin/php "$BASE/pt_activity.php" "$BASE/config.json"
