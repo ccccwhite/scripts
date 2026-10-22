@@ -16,11 +16,13 @@ qBittorrent 站点分类 → Transmission 4.1.3 标签。支持相同 Info Hash 
 
 依赖：Unraid 宿主机 PHP 及 cURL 扩展、qBittorrent Web API、Transmission 4.1 JSON-RPC。
 
-## qBittorrent 认证方式
+## qBittorrent 自动认证
 
-在本地 `config.json` 的 `qbittorrent` 部分设置 `auth_mode`：
+不需要设置 `auth_mode`。填写 `api_key` 或 `username` + `password` 即可，也可以两者都填。
 
-- `password`：使用 `username` 与 `password` 登录并获取 Cookie。
-- `api_key`：使用 qBittorrent 5.2.4 的 `api_key`，发送 Bearer 认证请求；此模式不需要填写用户名和密码。
+- 优先尝试 API Key (Bearer)，并通过读取分类与任务接口验证。
+- 如果 Key 不可用且用户名、密码均已填写，则自动回退账号密码登录。
+- 两种方式都不可用时明确报错；日志只说明选择的方式，不打印凭据。
+- Transmission 使用自身 RPC 的用户名/密码认证。
 
-Transmission 4.1.3 继续使用自身配置的用户名/密码进行 RPC HTTP 认证。不要将含凭据的 `config.json` 提交到仓库。
+不要提交真实的 `config.json` 到 GitHub。
