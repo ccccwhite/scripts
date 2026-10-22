@@ -1,8 +1,10 @@
 {
   "qbittorrent": {
     "url": "http://127.0.0.1:8080",
+    "auth_mode": "password",
     "username": "admin",
-    "password": ""
+    "password": "",
+    "api_key": ""
   },
   "transmission": {
     "rpc_url": "http://127.0.0.1:9091/transmission/rpc",
