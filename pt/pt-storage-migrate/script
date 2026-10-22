@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+BASE="/boot/config/plugins/user.scripts/pt-storage-migrate"
+exec 9>"$BASE/run.lock"
+flock -n 9 || exit 0
+/usr/bin/php "$BASE/migrate.php" "$BASE/config.json"
