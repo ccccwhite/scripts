@@ -343,6 +343,20 @@ try {
             // Check mountpoint with findmnt, avoiding accidental writes into an unmounted disk directory.
             $mount=trim((string)shell_exec('findmnt -rn -M '.escapeshellarg($host).' -o TARGET 2>/dev/null'));
             if($mount!==$host)throw new RuntimeException('HDD is not mounted at '.$host);
+            // Refuse to overwrite existing destination files, including symlinks.
+            $bytes=0;
+            foreach((array)($t['files']??[]) as $file){
+                $fn=(string)($file['name']??'');
+                if($fn===''||str_starts_with($fn,'/')||preg_match('~(^|/)\.\.(/|$)~',$fn))
+                    throw new RuntimeException('Unsafe file path in torrent');
+                $target=$host.'/'.$folder.'/'.$fn;
+                if(file_exists($target)||is_link($target))
+                    throw new RuntimeException('Destination already exists: '.$target);
+                $bytes+=(int)($file['length']??0);
+            }
+            $free=disk_free_space($host);
+            if($free===false||$free<$bytes+max(1073741824,(int)ceil($bytes*0.05)))
+                throw new RuntimeException('Insufficient HDD free space for safe move');
             if(!is_dir($host.'/'.$folder)&&!mkdir($host.'/'.$folder,0775,true)&&!is_dir($host.'/'.$folder))throw new RuntimeException('Cannot create site directory');
             // Transmission RPC move=true moves data and changes its download directory.
             $state[$hash]=['destination'=>$dest,'source'=>$dir,'requested_at'=>date(DATE_ATOM),'verify_requested'=>false,'qbit_hashes'=>$qremove];
