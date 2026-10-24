@@ -54,30 +54,48 @@ function qwrite(array $qb,string $endpoint,array $form,?string $cookie,array $he
 }
 function pathsOverlap(string $a,string $b): bool {return within($a,$b)||within($b,$a);}
 function inferSite(array $t,array $qitems,array $cfg): array {
-    $ssd=norm($cfg['ssd_path']);$hdd=norm($cfg['hdd_path']);
     $dir=norm((string)($t['download_dir']??'/'));
-    $candidates=[];
-    // A first-level directory below the storage root is the strongest site hint.
-    foreach([$ssd,$hdd] as $root){
-        if(within($dir,$root)&&$dir!==$root){
-            $relative=trim(substr($dir,strlen($root)),'/');
-            $part=explode('/',$relative)[0];
-            if(preg_match('/^[a-zA-Z0-9_-]+$/',$part))$candidates[strtolower($part)]=true;
-        }
-    }
     $hash=strtolower((string)($t['hash_string']??''));
     $ignored=array_map('strtolower',[$cfg['ssd_label'],$cfg['hdd_label'],$cfg['move_label']]);
+    $generic=['qbit','qbittorrent','trans','transmission','download','downloads','complete','completed','incomplete','temp','hdd','ssd'];
+    $hints=[];
     foreach((array)($t['labels']??[]) as $label){
         $v=strtolower(trim((string)$label));
-        if($v!==''&&!in_array($v,$ignored,true)&&!str_contains($v,':')&&preg_match('/^[a-z0-9_-]+$/',$v))$candidates[$v]=true;
+        if($v!==''&&!in_array($v,$ignored,true)&&!in_array($v,$generic,true)&&!str_contains($v,':')&&preg_match('/^[a-z0-9_-]+$/',$v))$hints[$v]=true;
     }
     foreach($qitems as $q){
         if(strtolower((string)($q['hash']??''))!==$hash)continue;
-        $category=strtolower(trim((string)($q['category']??'')));
-        if($category!==''&&preg_match('/^[a-z0-9_-]+$/',$category))$candidates[$category]=true;
+        $v=strtolower(trim((string)($q['category']??'')));
+        if($v!==''&&!in_array($v,$generic,true)&&preg_match('/^[a-z0-9_-]+$/',$v))$hints[$v]=true;
     }
-    if(count($candidates)!==1)return [null,'site ambiguous or missing: '.implode(',',array_keys($candidates))];
-    return [array_key_first($candidates),null];
+    $parts=[];
+    foreach([norm($cfg['ssd_path']),norm($cfg['hdd_path'])] as $root){
+        if(within($dir,$root)&&$dir!==$root){
+            $parts=array_values(array_filter(explode('/',trim(substr($dir,strlen($root)),'/')),'strlen'));
+            break;
+        }
+    }
+    $pathMatches=[];
+    foreach($parts as $part){
+        $v=strtolower($part);
+        if(isset($hints[$v]))$pathMatches[$v]=true;
+    }
+    // Explicit downloader labels/category must agree. Path components may contain generic client folders.
+    if(count($hints)>1)return [null,'conflicting site labels/categories: '.implode(',',array_keys($hints))];
+    if(count($hints)===1){
+        $site=array_key_first($hints);
+        // If the path has a non-generic final directory, it must agree with the explicit site.
+        $last=strtolower((string)end($parts));
+        if($last!==''&&!in_array($last,$generic,true)&&$last!==$site&&count($parts)>0)
+            return [null,'site path conflicts with label/category: '.$last.' vs '.$site];
+        return [$site,null];
+    }
+    // Without labels, accept only a single direct site directory, not nested downloader paths.
+    if(count($parts)===1){
+        $site=strtolower($parts[0]);
+        if(!in_array($site,$generic,true)&&preg_match('/^[a-z0-9_-]+$/',$site))return [$site,null];
+    }
+    return [null,'site missing or ambiguous'];
 }
 function saveState(string $path,array $state): void {
     $tmp=tempnam(dirname($path),'.storage-');
