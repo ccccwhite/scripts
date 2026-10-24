@@ -53,6 +53,40 @@ function qwrite(array $qb,string $endpoint,array $form,?string $cookie,array $he
     if($status!==200&&$status!==204)throw new RuntimeException('qBittorrent write '.$endpoint.' HTTP '.$status);
 }
 function pathsOverlap(string $a,string $b): bool {return within($a,$b)||within($b,$a);}
+
+function qbitStopped(array $q): bool {
+    $state=(string)($q['state']??'');
+    return in_array($state,['stoppedUP','stoppedDL','pausedUP','pausedDL'],true);
+}
+function qbitComplete(array $q): bool {
+    return (float)($q['progress']??0)>=0.999999 && (int)($q['amount_left']??0)===0;
+}
+function qbitPath(array $q): array {
+    $save=norm((string)($q['save_path']??'/'));
+    $content=norm((string)($q['content_path']??'/'));
+    return ['path'=>$content!=='/'?$content:$save,'save'=>$save];
+}
+function qbitMoveGuards(array $qitems,array $files,string $hash): array {
+    $toRemove=[];
+    foreach($qitems as $q){
+        $qh=strtolower((string)($q['hash']??''));
+        $p=qbitPath($q);
+        $overlap=false;
+        foreach($files as $f){
+            if(pathsOverlap($f,$p['path'])||($p['path']===$p['save']&&within($f,$p['save']))){$overlap=true;break;}
+        }
+        if(!$overlap)continue;
+        if($qh!==$hash)return [null,'shared with other qBittorrent task '.substr($qh,0,12)];
+        if(!qbitStopped($q))return [null,'matching qBittorrent task is not paused/stopped ('.($q['state']??'?').')'];
+        if(!qbitComplete($q))return [null,'matching qBittorrent task is incomplete'];
+        $toRemove[$qh]=true;
+    }
+    return [array_keys($toRemove),null];
+}
+function qbitRemoveTask(array $qb,string $hash,?string $cookie,array $headers): void {
+    // deleteFiles=false is essential: remove only qBittorrent metadata, never the data.
+    qwrite($qb,'torrents/delete',['hashes'=>$hash,'deleteFiles'=>'false'],$cookie,$headers);
+}
 function inferSite(array $t,array $qitems,array $cfg): array {
     $dir=norm((string)($t['download_dir']??'/'));
     $hash=strtolower((string)($t['hash_string']??''));
@@ -189,9 +223,65 @@ try {
             if(isset($state[$hash])){
                 [$ok,$message]=verifyDestination($t,$state[$hash],$cfg);
                 if($ok){
+                    // Do not finalize until Transmission has completed a full hash recheck.
+                    if(empty($state[$hash]['verify_requested'])){
+                        say(($dry?'PREVIEW VERIFY':'VERIFY').' '.substr($hash,0,12).' : destination sizes OK; require hash recheck');
+                        if(!$dry&&$moveEnabled){
+                            rpc($tr,'torrent_verify',['ids'=>[$id]],$session);
+                            $state[$hash]['verify_requested']=true;
+                            saveState($statePath,$state);
+                        }
+                        continue;
+                    }
+                    if(in_array((int)($t['status']??-1),[1,2],true)){
+                        say('PENDING '.substr($hash,0,12).' : Transmission verifying');
+                        continue;
+                    }
+                    if((float)($t['percent_done']??0)<0.999999||(int)($t['error']??0)!==0){
+                        say('PENDING '.substr($hash,0,12).' : Transmission recheck incomplete or error');
+                        continue;
+                    }
+                    // The matching qBittorrent task must still be stopped and complete.
+                    // Re-evaluate all overlapping qBittorrent paths immediately before deletion.
+                    $sourceFiles=[];
+                    foreach((array)($t['files']??[]) as $file){
+                        $fn=(string)($file['name']??'');
+                        if($fn===''||str_starts_with($fn,'/')||preg_match('~(^|/)\.\.(/|$)~',$fn))throw new RuntimeException('Unsafe pending file name');
+                        $sourceFiles[]=norm($state[$hash]['source'].'/'.$fn);
+                    }
+                    [$qremove,$qerror]=qbitMoveGuards($qitems,$sourceFiles,$hash);
+                    if($qerror!==null){
+                        say('PENDING '.substr($hash,0,12).' : qBittorrent safety check: '.$qerror);
+                        continue;
+                    }
+                    if(!empty($state[$hash]['qbit_hashes'])){
+                        $expected=$state[$hash]['qbit_hashes'];
+                        sort($expected);sort($qremove);
+                        if($expected!==$qremove){
+                            say('PENDING '.substr($hash,0,12).' : matching qBittorrent tasks changed; manual review required');
+                            continue;
+                        }
+                    }
+                    if($qremove&&!($cfg['delete_qbit_after_move']??false)){
+                        say('PENDING '.substr($hash,0,12).' : qBittorrent removal requires delete_qbit_after_move=true');
+                        continue;
+                    }
+                    if($qremove){
+                        say(($dry||!$moveEnabled?'PREVIEW DELETE qBittorrent':'DELETE qBittorrent task only').' '.implode(',',$qremove));
+                        if(!$dry&&$moveEnabled){
+                            foreach($qremove as $qh)qbitRemoveTask($qb,$qh,$cookie,$headers);
+                            $current=qreq($qb,'torrents/info?filter=all',$cookie,$headers);
+                            foreach($current as $item)if(in_array(strtolower((string)($item['hash']??'')),$qremove,true))
+                                throw new RuntimeException('qBittorrent task still present after delete; will retry safely');
+                        }
+                    }
+                    if($dry||!$moveEnabled){
+                        say('PREVIEW COMPLETE '.substr($hash,0,12).' : verification and task removal requirements satisfied');
+                        continue;
+                    }
                     $fixed=array_values(array_unique(array_merge(array_values(array_diff($old,[$cfg['move_label'],$cfg['ssd_label'],$cfg['hdd_label']])),[$cfg['hdd_label']])));
                     say(($dry?'PREVIEW COMPLETE':'COMPLETE').' '.substr($hash,0,12).' : '.$message);
-                    if(!$dry){
+                    if(!$dry&&$moveEnabled){
                         if(!sameSet($old,$fixed))rpc($tr,'torrent_set',['ids'=>[$id],'labels'=>$fixed],$session);
                         unset($state[$hash]);saveState($statePath,$state);
                     }
@@ -200,7 +290,7 @@ try {
                     say('PENDING '.substr($hash,0,12).' : '.$message.'; status='.(string)($t['status']??'?').'; error='.$err);
                     if($err!==0&&empty($state[$hash]['verify_requested'])){
                         say(($dry?'PREVIEW VERIFY':'VERIFY').' '.substr($hash,0,12).' : '.(string)($t['error_string']??''));
-                        if(!$dry){
+                        if(!$dry&&$moveEnabled){
                             rpc($tr,'torrent_verify',['ids'=>[$id]],$session);
                             $state[$hash]['verify_requested']=true;saveState($statePath,$state);
                         }
@@ -236,13 +326,10 @@ try {
                 foreach($files as $f)foreach($other['paths'] as $o)if(pathsOverlap($f,$o)){$reason='shared with Transmission task '.$other['id'];break 2;}
                 if($reason!==null&&str_starts_with($reason,'shared'))break;
             }
-            foreach($qpaths as $q) {
-                foreach($files as $f) {
-                    if(pathsOverlap($f,$q['path'])||($q['path']===$q['save']&&within($f,$q['save']))) {
-                        $reason='qBittorrent may share files ('.substr($q['hash'],0,12).')';break 2;
-                    }
-                }
-            }
+            [$qremove,$qerror]=qbitMoveGuards($qitems,$files,$hash);
+            if($qerror!==null)$reason=$qerror;
+            if($qremove&&!($cfg['delete_qbit_after_move']??false))
+                $reason='matching qBittorrent task needs delete_qbit_after_move=true';
             if($reason!==null){say('SKIP '.substr($hash,0,12).' '.$name.' : '.$reason);continue;}
             // Explicitly keep actual moves disabled unless both switches are changed.
             $folder=$cfg['site_folder_case']==='lower'?strtolower($site):$site;
@@ -258,7 +345,7 @@ try {
             if($mount!==$host)throw new RuntimeException('HDD is not mounted at '.$host);
             if(!is_dir($host.'/'.$folder)&&!mkdir($host.'/'.$folder,0775,true)&&!is_dir($host.'/'.$folder))throw new RuntimeException('Cannot create site directory');
             // Transmission RPC move=true moves data and changes its download directory.
-            $state[$hash]=['destination'=>$dest,'source'=>$dir,'requested_at'=>date(DATE_ATOM),'verify_requested'=>false];
+            $state[$hash]=['destination'=>$dest,'source'=>$dir,'requested_at'=>date(DATE_ATOM),'verify_requested'=>false,'qbit_hashes'=>$qremove];
             saveState($statePath,$state);
             rpc($tr,'torrent_set_location',['ids'=>[$id],'location'=>$dest,'move'=>true],$session);
             say('MOVE REQUESTED '.$hash.' ; check again on next run');
