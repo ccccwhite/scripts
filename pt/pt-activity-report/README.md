@@ -15,3 +15,14 @@
 `hr_rules` 中 0 表示规则未配置，禁止视为达标。规则须自行依据站点政策核实。无需提交 `config.json`、`state.json`、`report.csv` 等运行文件。
 
 **预览版：未在真实下载器环境完成联调。**
+
+
+## 下载完成时间与输出
+
+CSV 和 HTML 新增“下载完成时间”：qBittorrent 使用 completion_on，Transmission 使用 done_date，按配置 timezone 显示；零或负值显示未知。两客户端分别保留记录，合计行显示已知最早时间。Transmission 导入任务的时间不一定是 qBit 原始完成时间，qBit 任务删除后不能恢复未保存的原始时间。
+
+统一入口先采集 CSV，再自动运行 render_report.php 更新 HTML。渲染器支持同一个配置参数，读取 csv_file，HTML 默认输出在 CSV 同目录，也可设置 html_file。旧 CSV 缺少时间列仍可渲染，显示未知。
+
+直接 PHP 采集也有运行锁；CSV 使用临时文件原子替换后再保存采样状态，失败会报错。上传计数重置后重新建立基线，小额上传会累计至 minimum_upload_bytes 阈值。H&R any 模式在已知做种时间满足时，不因缺少分享率而误报。统计仍是本地估算，两个客户端做种时间可能重叠。
+
+未配置 H&R 规则的站点仍可根据 qBit 分类或单一非系统标签显示站点名，但不会推定 H&R 达标。

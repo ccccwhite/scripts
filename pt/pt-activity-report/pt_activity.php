@@ -62,6 +62,7 @@ function qbList(array $cfg): array {
         }
 
         $cookie = tempnam(sys_get_temp_dir(), 'qbcat');
+        if($cookie===false)throw new RuntimeException('Cannot create cookie file');
 
         [$status, $response] = req(
             $base.'/api/v2/auth/login',
@@ -135,11 +136,25 @@ function rpc(array $cfg): array {
     }
     throw new RuntimeException('Transmission session negotiation failed');
 }
-function csvline($stream,array $fields): void {fputcsv($stream,$fields);}
+function csvline($stream,array $fields): void {if(fputcsv($stream,$fields)===false)throw new RuntimeException('Cannot write CSV');}
+function atomicWrite(string $path,string $data): void {
+    $dir=dirname($path);
+    if(!is_dir($dir)&&!mkdir($dir,0700,true))throw new RuntimeException('Cannot create output directory');
+    $tmp=tempnam($dir,'.report-');
+    if($tmp===false)throw new RuntimeException('Cannot create output file');
+    try {
+        if(!chmod($tmp,0600)||file_put_contents($tmp,$data)!==strlen($data)||!rename($tmp,$path))throw new RuntimeException('Cannot replace output: '.$path);
+    } finally {if(is_file($tmp))unlink($tmp);}
+}
 try {
     if(!extension_loaded('curl'))throw new RuntimeException('PHP cURL is required');
     $path=$argv[1]??__DIR__.'/config.json';
     $cfg=mergeCredentials(json_decode((string)file_get_contents($path),true,512,JSON_THROW_ON_ERROR));
+    $lockPath=dirname($path).'/report.lock';
+    if(is_link($lockPath))throw new RuntimeException('Unsafe lock path');
+    $runLock=fopen($lockPath,'c');
+    if(!$runLock)throw new RuntimeException('Cannot open run lock');
+    if(!flock($runLock,LOCK_EX|LOCK_NB)){echo "Another PHP run is active; skipped\n";exit(0);}
     $tz=new DateTimeZone((string)($cfg['timezone']??'Asia/Shanghai'));
     $now=time();
     $stateFile=$cfg['state_file']??__DIR__.'/state.json';
@@ -147,7 +162,8 @@ try {
     $limit=(float)($cfg['minimum_upload_bytes']??0);
     $threshold=max(0,(int)($cfg['inactive_days']??30));
     $old=is_file($stateFile)?json_decode((string)file_get_contents($stateFile),true,512,JSON_THROW_ON_ERROR):[];
-    if(!is_array($old))$old=[];
+    if(!is_array($old))throw new RuntimeException('Invalid activity state');
+    if($limit<0)throw new RuntimeException('minimum_upload_bytes must be nonnegative');
     $new=[];$rows=[];
     $trans=rpc($cfg['transmission']);
     foreach($trans as $t){
@@ -156,6 +172,7 @@ try {
             'uploaded'=>(int)($t['uploaded_ever']??0),'ratio'=>(float)($t['upload_ratio']??0),
             'seed_seconds'=>max(0,(int)($t['seconds_seeding']??0)),
             'last_activity'=>(int)($t['activity_date']??0),
+            'completed_at'=>max(0,(int)($t['done_date']??0)),
             'storage'=>(string)($t['download_dir']??''),
             'labels'=>(array)($t['labels']??[]),
             'status'=>(string)($t['status']??''),'complete'=>(float)($t['percent_done']??0),
@@ -168,6 +185,7 @@ try {
             'uploaded'=>(int)($t['uploaded']??0),'ratio'=>(float)($t['ratio']??0),
             'seed_seconds'=>max(0,(int)($t['seeding_time']??0)),
             'last_activity'=>(int)($t['last_activity']??0),
+            'completed_at'=>max(0,(int)($t['completion_on']??0)),
             'storage'=>(string)($t['save_path']??''),
             'labels'=>array_values(array_filter(array_map('trim',explode(',',(string)($t['tags']??''))))),
             'status'=>(string)($t['state']??''),'complete'=>(float)($t['progress']??0),
@@ -179,14 +197,16 @@ try {
         $prev=$old[$key]??null;
         $since=null;$note='首次采样，上传停止时长未知';
         if(is_array($prev)){
-            $since=(int)($prev['last_upload_seen']??($prev['first_seen']??$now));
-            if($r['uploaded']>(int)($prev['uploaded']??0)+$limit){
+            $since=min($now,(int)($prev['last_upload_seen']??($prev['first_seen']??$now)));
+            if($r['uploaded']>=(int)($prev['uploaded']??0)&&$r['uploaded']>(int)($prev['upload_baseline']??$prev['uploaded']??0)+$limit){
                 $since=$now;$note='本轮发现上传量增长';
             }elseif($r['uploaded']<(int)($prev['uploaded']??0)){
                 $since=null;$note='上传计数减少，重新记录';
             }else{$note='本轮未发现上传增长';}
         }
-        $new[$key]=['uploaded'=>$r['uploaded'],'first_seen'=>(int)($prev['first_seen']??$now),
+        $baseline=$r['uploaded'];
+        if(is_array($prev)&&$r['uploaded']>=(int)($prev['uploaded']??0)&&$r['uploaded']<=(int)($prev['upload_baseline']??$prev['uploaded']??0)+$limit)$baseline=(int)($prev['upload_baseline']??$prev['uploaded']);
+        $new[$key]=['uploaded'=>$r['uploaded'],'upload_baseline'=>$baseline,'first_seen'=>$since===null?$now:(int)($prev['first_seen']??$now),
                     'last_upload_seen'=>$since??$now,'observations'=>(int)($prev['observations']??0)+1];
         $r['days']=$since===null?null:($now-$since)/86400;
         $r['note']=$note;
@@ -198,6 +218,11 @@ try {
         $matched=array_values(array_filter(array_keys($rules),fn($name)=>in_array($name,$sites,true)));
         if(count($matched)>1)$r['hr']='多个站点匹配，待确认';
         elseif(count($matched)===1){$r['site']=$matched[0];$r['hr']='等待合计判断';}
+        elseif($r['category']!=='')$r['site']=$r['category'];
+        else {
+            $siteLabels=array_values(array_filter($r['labels'],fn($label)=>is_string($label)&&$label!==''&&!str_starts_with($label,'storage:')&&!str_starts_with($label,'move:')&&!str_starts_with($label,'IYUU')));
+            if(count($siteLabels)===1)$r['site']=$siteLabels[0];
+        }
     }
     unset($r);
 
@@ -227,12 +252,13 @@ try {
         $minH=(float)($rule['min_seeding_hours']??0);
         $minR=(float)($rule['min_ratio']??0);
         $logic=(string)($rule['logic']??'all');
+        if(!in_array($logic,['all','any'],true))throw new RuntimeException('HR logic must be all or any');
         if($minH<=0&&$minR<=0){$r['hr']='规则未配置';continue;}
         if($r['complete']<1){$r['hr']='未完成，待判断';continue;}
         $tests=[];
         if($minH>0)$tests[]=$r['combined_hours']>=$minH;
         if($minR>0&&$r['combined_ratio']!==null)$tests[]=$r['combined_ratio']>=$minR;
-        if($minR>0&&$r['combined_ratio']===null){
+        if($minR>0&&$r['combined_ratio']===null&&!($logic==='any'&&in_array(true,$tests,true))){
             $r['hr']='文件大小缺失/不一致，无法估算合并分享率';continue;
         }
         $pass=$logic==='any'?in_array(true,$tests,true):!in_array(false,$tests,true);
@@ -240,28 +266,24 @@ try {
     }
     unset($r);
     usort($rows,fn($a,$b)=>($b['days']??-1)<=>($a['days']??-1));
-    $dir=dirname($stateFile);if(!is_dir($dir))mkdir($dir,0700,true);
-    $tmp=tempnam($dir,'.activity-');
-    if($tmp===false)throw new RuntimeException('Cannot create state file');
-    chmod($tmp,0600);
-    file_put_contents($tmp,json_encode($new,JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR)."\n");
-    rename($tmp,$stateFile);
-    $csvDir=dirname($csvPath);if(!is_dir($csvDir))mkdir($csvDir,0700,true);
-    $out=fopen($csvPath,'wb');
-    if(!$out)throw new RuntimeException('Cannot open CSV');
+    $out=fopen('php://temp','w+b');
+    if(!$out)throw new RuntimeException('Cannot create CSV buffer');
     fwrite($out,"\xEF\xBB\xBF");
-    csvline($out,['下载器','站点','种子名称','Hash','未观察到上传天数','本客户端做种小时','本客户端分享率','同站同Hash合计做种小时','同站同Hash合计分享率估算','H&R本地估算','状态说明','最近数据传输时间','累计上传字节','完成度','分类或标签','保存路径']);
-    $fmt=function(?int $ts)use($tz){return $ts?((new DateTimeImmutable('@'.$ts))->setTimezone($tz)->format('Y-m-d H:i:s')):'未知';};
+    csvline($out,['下载器','站点','种子名称','Hash','未观察到上传天数','本客户端做种小时','本客户端分享率','同站同Hash合计做种小时','同站同Hash合计分享率估算','H&R本地估算','状态说明','最近数据传输时间','累计上传字节','完成度','分类或标签','保存路径','下载完成时间']);
+    $fmt=function(?int $ts)use($tz){return $ts!==null&&$ts>0?((new DateTimeImmutable('@'.$ts))->setTimezone($tz)->format('Y-m-d H:i:s')):'未知';};
     $qualified=0;$unknown=0;
     foreach($rows as $r){
         $days=$r['days'];if($days===null)$unknown++;
         $flag=($days!==null&&$days>=$threshold&&$r['complete']>=1);
         if($flag)$qualified++;
         csvline($out,[$r['client'],$r['site'],$r['name'],$r['hash'],$days===null?'未知':round($days,2),round($r['seed_seconds']/3600,2),round($r['ratio'],4),$r['combined_hours']===null?'未知':round($r['combined_hours'],2),$r['combined_ratio']===null?'未知':round($r['combined_ratio'],4),$r['hr'],$r['note'],
-            $fmt($r['last_activity']),$r['uploaded'],$r['complete'],implode('|',$r['labels']),$r['storage']]);
+            $fmt($r['last_activity']),$r['uploaded'],$r['complete'],implode('|',$r['labels']),$r['storage'],$fmt($r['completed_at'])]);
         if($flag)echo sprintf("[>= %d 天无观察到上传] %.1f 天 | %s | %s\n",$threshold,$days,$r['client'].' / '.$r['name'],substr($r['hash'],0,12));
     }
-    fclose($out);
+    rewind($out);$csv=stream_get_contents($out);fclose($out);
+    if($csv===false)throw new RuntimeException('Cannot read CSV buffer');
+    atomicWrite($csvPath,$csv);
+    atomicWrite($stateFile,json_encode($new,JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR)."\n");
     printf("qBittorrent: %d, Transmission: %d, 达到 %d 天阈值: %d, 历史不足: %d\n",count($qbt),count($trans),$threshold,$qualified,$unknown);
     echo "CSV 报告: $csvPath\n";
     echo "注意：H&R 是依据手动规则做本地估算，不是站点实际判罚/免 H&R 状态；首次运行只建立上传基线。\n";

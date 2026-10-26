@@ -26,3 +26,10 @@ qBittorrent 站点分类 → Transmission 4.1.3 标签。支持相同 Info Hash 
 - Transmission 使用自身 RPC 的用户名/密码认证。
 
 不要提交真实的 `config.json` 到 GitHub。
+
+
+## 修复与运行保护
+
+当前 qBit 同 Hash 分类优先于 Tracker 推断；任务已在 qBit 清空分类时清除旧 Hash 缓存。Tracker 学习只接受 HTTP/HTTPS/UDP 地址，域名冲突时跳过，不从旧缓存补回冲突结果。预览不写分类缓存。
+
+直接 PHP 调用也有运行锁；分类同步与同目录下 pt-storage-migrate 的每轮操作共用迁移锁，迁移忙时跳过本次同步。更新标签前重新读取并保留已有标签，用完整 Hash 定位任务。其他外部工具同时改标签仍可能发生竞争。

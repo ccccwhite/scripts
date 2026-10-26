@@ -1,8 +1,9 @@
 <?php
 declare(strict_types=1);
 $base = __DIR__;
-$csv = $base . '/report.csv';
-$htmlPath = $base . '/report.html';
+$cfg=json_decode((string)file_get_contents($argv[1]??$base.'/config.json'),true,512,JSON_THROW_ON_ERROR);
+$csv=$cfg['csv_file']??$base.'/report.csv';
+$htmlPath=$cfg['html_file']??dirname($csv).'/report.html';
 if (!is_readable($csv)) { fwrite(STDERR, "CSV source unavailable: $csv\n"); exit(1); }
 $stream = fopen($csv, 'rb');
 if (!$stream) { fwrite(STDERR, "Cannot open report CSV\n"); exit(1); }
@@ -33,15 +34,18 @@ foreach($groups as $items){
     $hours=getv($first,'同站同Hash合计做种小时');
     $ratio=getv($first,'同站同Hash合计分享率估算');
     $hr=getv($first,'H&R本地估算');
-    $activity=''; $uploadTotal=0;
+    $activity=''; $completed=''; $uploadTotal=0;
     foreach($items as $r){
         $dt=getv($r,'最近数据传输时间');
         if($dt!=='' && $dt!=='未知' && $dt>$activity)$activity=$dt;
+        $done=getv($r,'下载完成时间');
+        if($done!==''&&$done!=='未知'&&($completed===''||$done<$completed))$completed=$done;
         $uploadTotal+=(float)getv($r,'累计上传字节');
     }
     $nameHtml='<details><summary>'.esc($name).'</summary><div class="details">Hash：<code>'.esc(getv($first,'Hash')).'</code></div></details>';
     $rows.='<tbody class="torrent-group"><tr class="total"><td>'.esc($site).'</td><td><b>合计</b></td>'
         .'<td class="name">'.$nameHtml.'</td><td data-sort="'.esc($activity).'">'.esc($activity?:'未知').'</td>'
+        .'<td data-sort="'.esc($completed).'">'.esc($completed?:'未知').'</td>'
         .'<td data-sort="'.esc(is_numeric($hours)?$hours:-1).'">'.esc($hours).'</td>'
         .'<td data-sort="'.esc(is_numeric($ratio)?$ratio:-1).'">'.esc($ratio).'</td>'
         .'<td data-sort="'.esc($uploadTotal).'">'.esc(round($uploadTotal/1073741824,2)).' GiB</td><td>'.esc($hr).'</td></tr>';
@@ -55,7 +59,7 @@ foreach($groups as $items){
             .'<div>标签：'.esc(getv($r,'分类或标签')).'</div>'
             .'<div>状态：'.esc(getv($r,'状态说明')).'</div></div></details>';
         $rows.='<tr class="client"><td></td><td>'.esc($client).'</td><td class="name">'.$detail.'</td>'
-            .'<td>'.esc($dt?:'未知').'</td><td>'.esc($ch).'</td><td>'.esc($cr).'</td>'
+            .'<td>'.esc($dt?:'未知').'</td><td>'.esc(getv($r,'下载完成时间')?:'未知').'</td><td>'.esc($ch).'</td><td>'.esc($cr).'</td>'
             .'<td>'.esc(round($uploaded/1073741824,2)).' GiB</td><td></td></tr>';
     }
     $rows.='</tbody>'."\n";
@@ -65,7 +69,7 @@ $uniqueCount=count($groups);
 $clientCounts=[];
 foreach($records as $r){$c=getv($r,'下载器');$clientCounts[$c]=($clientCounts[$c]??0)+1;}
 $clientSummary=implode(' · ',array_map(fn($c,$n)=>$c.': '.$n,array_keys($clientCounts),array_values($clientCounts)));
-$updated=esc((new DateTimeImmutable('now', new DateTimeZone('Asia/Shanghai')))->format('Y-m-d H:i:s'));
+$updated=esc((new DateTimeImmutable('now', new DateTimeZone($cfg['timezone']??'Asia/Shanghai')))->format('Y-m-d H:i:s'));
 $count=$uniqueCount;
 $page=<<<'HTML'
 <!doctype html>
@@ -82,9 +86,9 @@ tbody.torrent-group{border-bottom:2px solid #8885}tbody tr:hover{background:#888
 </style></head><body>
 <header><div><h1>PT 种子活跃度</h1><p>更新：__UPDATED__ · 共 __COUNT__ 个不同种子 · __TASKCOUNT__ 条下载器任务 · 显示 <span id="visible">__COUNT__</span> 条<br>__CLIENTSUMMARY__</p></div>
 <input id="search" type="search" placeholder="搜索站点、种子名、下载器或 H&R 状态…"></header>
-<div class="wrapper"><table id="report"><thead><tr><th>站点</th><th>下载器</th><th>种子名称 / 详情</th><th>最近活动</th><th>做种（小时）</th><th>分享率</th><th>上传量</th><th>H&R 本地评估</th></tr></thead>
+<div class="wrapper"><table id="report"><thead><tr><th>站点</th><th>下载器</th><th>种子名称 / 详情</th><th>最近活动</th><th>下载完成时间</th><th>做种（小时）</th><th>分享率</th><th>上传量</th><th>H&R 本地评估</th></tr></thead>
 __ROWS__</table></div>
-<p class="note">相同站点与 Info Hash 的任务合并成一组，合计行与各下载器行分开；最近活动不一定代表实际上传。合计做种时间可能包含两个客户端的重叠时间。合计分享率是本地估算，H&R 不代表站点判定。点击表头排序，点击种子名称展开详情。</p>
+<p class="note">相同站点与 Info Hash 的任务合并成一组，合计行与各下载器行分开；最近活动不一定代表实际上传。完成时间来自各下载器，合计行显示已知最早时间；Transmission 导入任务的完成时间不一定是 qBit 原始下载完成时间。合计做种时间可能包含两个客户端的重叠时间。合计分享率是本地估算，H&R 不代表站点判定。点击表头排序，点击种子名称展开详情。</p>
 <script>
 const table=document.getElementById('report'), groups=[...table.querySelectorAll('tbody.torrent-group')],search=document.getElementById('search');
 let sortColumn=3,sortAsc=false;
@@ -105,9 +109,11 @@ function redraw(){
 search.addEventListener('input',redraw);redraw();
 </script></body></html>
 HTML;
-$page=str_replace(['__UPDATED__','__COUNT__','__TASKCOUNT__','__CLIENTSUMMARY__','__ROWS__'],[$updated,(string)$count,(string)$taskCount,esc($clientSummary),$rows],$page);
-$tmp=$htmlPath.'.tmp';
-if(file_put_contents($tmp,$page)===false){fwrite(STDERR,"Cannot write report HTML\n");exit(1);}
+$page=strtr($page,['__UPDATED__'=>$updated,'__COUNT__'=>(string)$count,'__TASKCOUNT__'=>(string)$taskCount,'__CLIENTSUMMARY__'=>esc($clientSummary),'__ROWS__'=>$rows]);
+if(!is_dir(dirname($htmlPath))&&!mkdir(dirname($htmlPath),0700,true))throw new RuntimeException('Cannot create HTML directory');
+$tmp=tempnam(dirname($htmlPath),'.html-');
+if($tmp===false)throw new RuntimeException('Cannot create HTML temporary file');
+if(file_put_contents($tmp,$page)!==strlen($page)){fwrite(STDERR,"Cannot write report HTML\n");exit(1);}
 chmod($tmp,0600);
 if(!rename($tmp,$htmlPath)){fwrite(STDERR,"Cannot replace report HTML\n");exit(1);}
 echo "HTML 报表: $htmlPath ($count 个不同种子，$taskCount 条下载器任务)\n";

@@ -64,6 +64,20 @@ try {
     if(!extension_loaded('curl'))throw new RuntimeException('PHP curl extension required');
     $path=$argv[1]??__DIR__.'/config.json';
     $cfg=mergeCredentials(asjson((string)file_get_contents($path)));
+    $lockPath=dirname($path).'/sync.lock';
+    if(is_link($lockPath))throw new RuntimeException('Unsafe lock path');
+    $runLock=fopen($lockPath,'c');
+    if(!$runLock)throw new RuntimeException('Cannot open run lock');
+    if(!flock($runLock,LOCK_EX|LOCK_NB)){echo "Another PHP run is active; skipped\n";exit(0);}
+    $migrationLockPath=dirname(__DIR__).'/pt-storage-migrate/run.lock';
+    $migrationLock=null;
+    if(is_dir(dirname($migrationLockPath))){
+        if(is_link($migrationLockPath))throw new RuntimeException('Unsafe migration lock');
+        $migrationLock=fopen($migrationLockPath,'c');
+        if(!$migrationLock)throw new RuntimeException('Cannot open migration lock');
+        if(!flock($migrationLock,LOCK_EX|LOCK_NB)){logmsg('Migration pass active; category sync skipped');exit(0);}
+    }
+    if(isset($cfg['dry_run'])&&!is_bool($cfg['dry_run']))throw new RuntimeException('dry_run must be a JSON boolean');
     $qb=$cfg['qbittorrent'];$tr=$cfg['transmission'];
     $dry=(bool)($cfg['dry_run']??true);
     $cachePath=$cfg['cache_file']??dirname($path).'/cache.json';
@@ -71,6 +85,7 @@ try {
     if(($cfg['use_cache']??true)&&is_file($cachePath)){
         $read=asjson((string)file_get_contents($cachePath));
         $cache=array_merge($cache,$read);
+        foreach(['hash_category','tracker_category'] as $field)if(!is_array($cache[$field]))throw new RuntimeException('Invalid category cache');
     }
     $cookie=null;$authHeaders=[];
     $key=trim((string)($qb['api_key']??''));
@@ -117,22 +132,25 @@ try {
             if($st!==200)continue;
             $tracks=asjson($body);
             foreach($tracks as $track){
-                $host=hostof((string)($track['url']??''));
+                $url=(string)($track['url']??'');
+                if(!in_array(strtolower((string)parse_url($url,PHP_URL_SCHEME)),['http','https','udp'],true))continue;
+                $host=hostof($url);
                 if($host!=='')$learn[$host][$cat]=true;
             }
         }
     } finally { if($cookie!==null) @unlink($cookie); }
+    foreach($torrents as $t)unset($cache['hash_category'][strtolower((string)($t['hash']??''))]);
     foreach($hashMap as $h=>$cat)$cache['hash_category'][$h]=$cat;
     foreach($learn as $host=>$cats){
         if(count($cats)===1)$cache['tracker_category'][$host]=array_key_first($cats);
         else unset($cache['tracker_category'][$host]);
     }
-    if($cfg['use_cache']??true){
+    if(!$dry&&($cfg['use_cache']??true)){
         $dir=dirname($cachePath);if(!is_dir($dir))mkdir($dir,0700,true);
         $tmp=tempnam($dir,'.cache-');if($tmp===false)throw new RuntimeException('Cache file error');
         chmod($tmp,0600);
-        file_put_contents($tmp,json_encode($cache,JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR)."\n");
-        rename($tmp,$cachePath);
+        $data=json_encode($cache,JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR)."\n";
+        if(file_put_contents($tmp,$data)!==strlen($data)||!rename($tmp,$cachePath)){@unlink($tmp);throw new RuntimeException('Cannot save category cache');}
     }
     $session='';
     $res=rpc($tr['rpc_url'],$tr['username']??'',$tr['password']??'','torrent_get',['fields'=>['id','hash_string','labels','trackers']],$session);
@@ -144,22 +162,32 @@ try {
         $candidates=[];
         if(isset($hashMap[$hash]))$candidates[$hashMap[$hash]]=true;
         elseif(isset($cache['hash_category'][$hash]))$candidates[$cache['hash_category'][$hash]]=true;
-        foreach((array)($item['trackers']??[]) as $tracker){
+        if(!$candidates)foreach((array)($item['trackers']??[]) as $tracker){
             $host=hostof((string)($tracker['announce']??''));
             if($host==='')continue;
             $matches=matchRule($host,(array)($cfg['tracker_domain_rules']??[]));
-            if(count($matches)===0&&isset($learn[$host])&&count($learn[$host])===1)$matches=[array_key_first($learn[$host])];
+            if(count($matches)===0&&isset($learn[$host])){
+                if(count($learn[$host])!==1){$candidates['__ambiguous__']=true;continue;}
+                $matches=[array_key_first($learn[$host])];
+            }
             if(count($matches)===0&&isset($cache['tracker_category'][$host]))$matches=[$cache['tracker_category'][$host]];
             foreach($matches as $cat)$candidates[$cat]=true;
         }
-        if(count($candidates)!==1){$skipped++;continue;}
+        if(isset($candidates['__ambiguous__'])||count($candidates)!==1){$skipped++;continue;}
         $cat=array_key_first($candidates);
         if(($cfg['only_current_qbit_categories']??false)&&!isset($valid[$cat]))continue;
         if(in_array($cat,$existing,true))continue;
+        if(!$dry){
+            $fresh=rpc($tr['rpc_url'],$tr['username']??'',$tr['password']??'','torrent_get',['ids'=>[$hash],'fields'=>['hash_string','labels']],$session)['torrents']??[];
+            if(count($fresh)!==1||strtolower((string)($fresh[0]['hash_string']??''))!==$hash){$skipped++;continue;}
+            $existing=array_values(array_filter((array)($fresh[0]['labels']??[]),'is_string'));
+            if(in_array($cat,$existing,true))continue;
+        }
         $new=array_values(array_unique(array_merge($existing,[$cat])));
         logmsg(($dry?'PREVIEW':'UPDATE').' torrent '.substr($hash,0,12).' add label '.$cat);
-        if(!$dry)rpc($tr['rpc_url'],$tr['username']??'',$tr['password']??'','torrent_set',['ids'=>[(int)$item['id']],'labels'=>$new],$session);
+        if(!$dry)rpc($tr['rpc_url'],$tr['username']??'',$tr['password']??'','torrent_set',['ids'=>[$hash],'labels'=>$new],$session);
         $changed++;
     }
     logmsg('Done. '.($dry?'Preview changes':'Updated').': '.$changed.', unmatched/ambiguous: '.$skipped);
 } catch(Throwable $e) {fwrite(STDERR,'ERROR: '.$e->getMessage().PHP_EOL);exit(1);}
+
