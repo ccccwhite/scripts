@@ -27,6 +27,7 @@ Transmission 中完成下载且标记 `move:hdd` 的任务，从下载盘迁至 
 | `delete_qbit_after_move` | 示例配置为 `true`；旧配置缺省为 `false` | 迁移检查通过后允许删除同 Hash qBit 任务记录 |
 | `verify_after_move` | `false`，旧配置缺少此字段也按 `false` | 是否在内置移动完成后额外请求完整 Hash 校验 |
 | `max_pending_moves` | `1` | 限制尚未收尾的迁移数量；包含移动和校验阶段 |
+| `move_rpc_timeout` | `86400` 秒（24 小时），旧配置缺少此字段也使用此值 | 仅用于内置移动接口等待响应；普通 API 请求仍为 45 秒 |
 | `state_file` | 配置文件同目录 `state.json` | 持久化迁移阶段；同目录 `run.lock` 保护直接 PHP 和入口脚本调用 |
 
 开关必须是 JSON 布尔值，不要写成字符串。首次验证保持 `dry_run=true`、`enable_move=false`。实际移动需设为 `dry_run=false`、`enable_move=true`，且要保留 `delete_qbit_after_move=true` 才能处理存在同 Hash qBit 任务的种子。两个开关关闭时不会自动处理待完成迁移。
@@ -52,6 +53,10 @@ bash "$BASE/script" --interval=3 --timeout=86400
 ```
 
 `Ctrl+C` 会退出入口并清理本次启动的监控和 PHP 子进程，保留迁移状态。Transmission 已接受的移动或校验可能仍在后台继续；再次运行同一入口即可检查并继续。接口报错、需要人工确认或等待超时会退出并保留状态；启用完整校验时不会自动绕过其确认条件。重复启动入口会被工作流锁拦截。进度显示为磁盘占用估算，无法提供精确复制百分比。
+
+Transmission 的内置移动接口可能等待文件搬完才返回 HTTP 响应，大任务不能沿用普通 API 的 45 秒超时。移动请求默认等待最多 24 小时，期间集成监控继续显示文件变化；这不是强制等待 24 小时，操作完成返回后立即进入后续检查。入口 `--timeout` 控制每轮结束后的持续等待，正在执行的移动请求另受 `move_rpc_timeout` 限制。
+
+如果看到 `Operation timed out ... with 0 bytes received`，只表示没有及时收到接口响应，不代表 Transmission 已停止移动。保留 `state.json`，先用独立只读监控检查目标文件是否仍在增长；结果未确认前不要使用 `--retry-move`、删除状态或手动移动同一批文件。移动期间其他 Transmission API 查询也可能因服务忙而超时；待原操作结束后重新运行入口，会继续检查已有迁移而非重复发起。网络故障或超过移动等待上限仍会安全退出并保留状态。
 
 ## 保护与恢复
 

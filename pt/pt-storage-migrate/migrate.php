@@ -1,9 +1,10 @@
 <?php
 declare(strict_types=1);
 /** Unraid PHP PT storage label sync and conservative Transmission -> HDD mover. */
-function httpReq(string $url,string $method='GET',?string $body=null,array $headers=[],string $user='',string $pass='',?string $cookie=null): array {
+function httpReq(string $url,string $method='GET',?string $body=null,array $headers=[],string $user='',string $pass='',?string $cookie=null,int $timeout=45): array {
+    if($timeout<1)throw new RuntimeException('HTTP timeout must be positive');
     $h=[];$c=curl_init($url);
-    curl_setopt_array($c,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_CONNECTTIMEOUT=>7,CURLOPT_TIMEOUT=>45,CURLOPT_CUSTOMREQUEST=>$method,CURLOPT_HTTPHEADER=>$headers,CURLOPT_FOLLOWLOCATION=>false,CURLOPT_PROXY=>'',CURLOPT_NOPROXY=>'*',CURLOPT_HEADERFUNCTION=>function($ch,$line)use(&$h){$p=strpos($line,':');if($p!==false)$h[strtolower(trim(substr($line,0,$p)))]=trim(substr($line,$p+1));return strlen($line);}]);
+    curl_setopt_array($c,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_CONNECTTIMEOUT=>7,CURLOPT_TIMEOUT=>$timeout,CURLOPT_CUSTOMREQUEST=>$method,CURLOPT_HTTPHEADER=>$headers,CURLOPT_FOLLOWLOCATION=>false,CURLOPT_PROXY=>'',CURLOPT_NOPROXY=>'*',CURLOPT_HEADERFUNCTION=>function($ch,$line)use(&$h){$p=strpos($line,':');if($p!==false)$h[strtolower(trim(substr($line,0,$p)))]=trim(substr($line,$p+1));return strlen($line);}]);
     if($body!==null)curl_setopt($c,CURLOPT_POSTFIELDS,$body);
     if($user!=='')curl_setopt($c,CURLOPT_USERPWD,$user.':'.$pass);
     if($cookie!==null){curl_setopt($c,CURLOPT_COOKIEJAR,$cookie);curl_setopt($c,CURLOPT_COOKIEFILE,$cookie);}
@@ -12,12 +13,12 @@ function httpReq(string $url,string $method='GET',?string $body=null,array $head
     return [$status,(string)$res,$h];
 }
 function jsonArr(string $s): array {$v=json_decode($s,true,512,JSON_THROW_ON_ERROR);if(!is_array($v))throw new RuntimeException('Invalid JSON');return $v;}
-function rpc(array $tr,string $method,array $params,string &$session): array {
+function rpc(array $tr,string $method,array $params,string &$session,int $timeout=45): array {
     static $n=0;$id=++$n;$url=$tr['rpc_url'];
     $body=json_encode(['jsonrpc'=>'2.0','method'=>$method,'params'=>$params,'id'=>$id],JSON_THROW_ON_ERROR);
     for($i=0;$i<3;$i++){
         $headers=['Content-Type: application/json'];if($session!=='')$headers[]='X-Transmission-Session-Id: '.$session;
-        [$status,$response,$rh]=httpReq($url,'POST',$body,$headers,$tr['username']??'',$tr['password']??'');
+        [$status,$response,$rh]=httpReq($url,'POST',$body,$headers,$tr['username']??'',$tr['password']??'',null,$timeout);
         if($status===409){$session=$rh['x-transmission-session-id']??'';if($session==='')throw new RuntimeException('Transmission session ID missing');continue;}
         if($status!==200)throw new RuntimeException('Transmission HTTP '.$status);
         $result=jsonArr($response);if(isset($result['error']))throw new RuntimeException('Transmission: '.json_encode($result['error']));
@@ -306,11 +307,13 @@ function deletionPlan(array $entry,array $qitems,array $remove): array {
     }
     return $remove;
 }
-function sendMove(array $tr,array $t,string $hash,array &$state,string $statePath,string &$session): void {
+function sendMove(array $tr,array $t,string $hash,array &$state,string $statePath,string &$session,int $timeout=86400): void {
     $state[$hash]['phase']='move_requested';unset($state[$hash]['last_error']);
     saveState($statePath,$state); // Write intent before RPC: a timeout must never trigger an automatic duplicate move.
     try {
-        rpc($tr,'torrent_set_location',['ids'=>[(int)$t['id']],'location'=>$state[$hash]['destination'],'move'=>true],$session);
+        // Transmission may hold this response until the native filesystem move completes.
+        // The separate allocation observer remains live while this call waits.
+        rpc($tr,'torrent_set_location',['ids'=>[(int)$t['id']],'location'=>$state[$hash]['destination'],'move'=>true],$session,$timeout);
         $state[$hash]['phase']='moving';saveState($statePath,$state);
     }catch(Throwable $e){
         $state[$hash]['last_error']=$e->getMessage();saveState($statePath,$state);throw $e;
@@ -337,6 +340,9 @@ try {
     // Hold this handle until process exit. Direct PHP invocations use the same lock as the wrapper.
     $maxPending=$cfg['max_pending_moves']??1;
     if(!is_int($maxPending)||$maxPending<1)throw new RuntimeException('max_pending_moves must be a positive integer');
+    $moveTimeout=$cfg['move_rpc_timeout']??86400;
+    if(!is_int($moveTimeout)||$moveTimeout<1||$moveTimeout>604800)
+        throw new RuntimeException('move_rpc_timeout must be an integer from 1 to 604800 seconds');
     $retryHash='';$recheckHash='';$acceptHash='';
     foreach(array_slice($argv,2) as $arg){
         if(!preg_match('/^--(retry-move|recheck|accept-verified)=([a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/',$arg,$match))
@@ -434,7 +440,7 @@ try {
                     if($dry||!$moveEnabled){say('PREVIEW RETRY '.$hash);continue;}
                     $retryCfg=$cfg;$retryCfg['_reserved_bytes']=reservedBytes($state,$hash);
                     preflightDestination($t,$state[$hash],$retryCfg);
-                    sendMove($tr,$t,$hash,$state,$statePath,$session);
+                    sendMove($tr,$t,$hash,$state,$statePath,$session,$moveTimeout);
                     say('RETRY ACCEPTED '.$hash);continue;
                 }
                 if($recheckHash===$hash){
@@ -608,7 +614,7 @@ try {
             $moveCfg=$cfg;$moveCfg['_reserved_bytes']=reservedBytes($state);
             preflightDestination($current,$entry,$moveCfg);
             $state[$hash]=$entry;saveState($statePath,$state);
-            sendMove($tr,$current,$hash,$state,$statePath,$session);
+            sendMove($tr,$current,$hash,$state,$statePath,$session,$moveTimeout);
             say('MOVE ACCEPTED '.substr($hash,0,12).' : request accepted; inspect destination next run');
         }
         say('Summary: qBit label changes '.$qchanges.', Transmission label changes '.$tchanges.', marked move candidates '.$candidates);
