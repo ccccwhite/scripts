@@ -28,15 +28,16 @@ function rpc(array $tr,string $method,array $params,string &$session): array {
 }
 function norm(string $s): string {return '/'.trim(preg_replace('~/+~','/',$s),'/');}
 function within(string $path,string $root): bool {$path=norm($path);$root=norm($root);return $path===$root||str_starts_with($path,$root.'/');}
-function location(string $p,string $ssd,string $hdd): ?string {
+function location(string $p,string $ssd,string $hdd,string $download): ?string {
     if(within($p,$ssd))return 'ssd';
+    if(within($p,$download))return 'download';
     if(within($p,$hdd))return 'hdd';
     return null;
 }
 function changeLabels(array $labels,?string $loc,array $cfg): array {
     if($loc===null)return $labels;
-    $out=array_values(array_filter($labels,fn($x)=>$x!==$cfg['ssd_label']&&$x!==$cfg['hdd_label']));
-    $out[]=$loc==='ssd'?$cfg['ssd_label']:$cfg['hdd_label'];
+    $out=array_values(array_filter($labels,fn($x)=>!in_array($x,[$cfg['ssd_label'],$cfg['download_label'],$cfg['hdd_label']],true)));
+    $out[]=match($loc){'ssd'=>$cfg['ssd_label'],'download'=>$cfg['download_label'],'hdd'=>$cfg['hdd_label']};
     return array_values(array_unique($out));
 }
 function sameSet(array $a,array $b): bool {sort($a);sort($b);return $a===$b;}
@@ -90,7 +91,7 @@ function qbitRemoveTask(array $qb,string $hash,?string $cookie,array $headers): 
 function inferSite(array $t,array $qitems,array $cfg): array {
     $dir=norm((string)($t['download_dir']??'/'));
     $hash=strtolower((string)($t['hash_string']??''));
-    $ignored=array_map('strtolower',[$cfg['ssd_label'],$cfg['hdd_label'],$cfg['move_label']]);
+    $ignored=array_map('strtolower',[$cfg['ssd_label'],$cfg['download_label'],$cfg['hdd_label'],$cfg['move_label']]);
     $generic=['qbit','qbittorrent','trans','transmission','download','downloads','complete','completed','incomplete','temp','hdd','ssd'];
     $hints=[];
     foreach((array)($t['labels']??[]) as $label){
@@ -103,7 +104,7 @@ function inferSite(array $t,array $qitems,array $cfg): array {
         if($v!==''&&!in_array($v,$generic,true)&&preg_match('/^[a-z0-9_-]+$/',$v))$hints[$v]=true;
     }
     $parts=[];
-    foreach([norm($cfg['ssd_path']),norm($cfg['hdd_path'])] as $root){
+    foreach([norm($cfg['ssd_path']),norm($cfg['download_path']),norm($cfg['hdd_path'])] as $root){
         if(within($dir,$root)&&$dir!==$root){
             $parts=array_values(array_filter(explode('/',trim(substr($dir,strlen($root)),'/')),'strlen'));
             break;
@@ -161,8 +162,15 @@ try {
     $cred=jsonArr((string)file_get_contents($credFile));
     $qb=$cred['qbittorrent'];$tr=$cred['transmission'];
     $dry=(bool)($cfg['dry_run']??true);$moveEnabled=(bool)($cfg['enable_move']??false);
-    $ssd=norm($cfg['ssd_path']);$hdd=norm($cfg['hdd_path']);
-    if($ssd===$hdd||$ssd==='/'||$hdd==='/')throw new RuntimeException('Unsafe storage roots');
+    $cfg['download_path']=$cfg['download_path']??'/download-hdd';
+    $cfg['download_label']=$cfg['download_label']??'storage:download-hdd';
+    $ssd=norm($cfg['ssd_path']);$hdd=norm($cfg['hdd_path']);$download=norm($cfg['download_path']);
+    $roots=[$ssd,$download,$hdd];
+    foreach($roots as $i=>$root){
+        if($root==='/')throw new RuntimeException('Unsafe storage root');
+        foreach($roots as $j=>$other)if($i!==$j&&within($root,$other))
+            throw new RuntimeException('Overlapping storage roots: '.$root.' and '.$other);
+    }
     $statePath=$cfg['state_file']??dirname($configFile).'/state.json';
     $state=is_file($statePath)?jsonArr((string)file_get_contents($statePath)):[];
     $session='';$cookie=null;$headers=[];
@@ -186,8 +194,8 @@ try {
         foreach($qitems as $q) {
             $hash=strtolower((string)($q['hash']??''));$save=norm((string)($q['save_path']??'/'));
             $content=norm((string)($q['content_path']??'/'));
-            $loc=location($save,$ssd,$hdd);
-            if($loc===null||($content!=='/'&&location($content,$ssd,$hdd)!==$loc)) {
+            $loc=location($save,$ssd,$hdd,$download);
+            if($loc===null||($content!=='/'&&location($content,$ssd,$hdd,$download)!==$loc)) {
                 say('WARN qBit '.$hash.' ambiguous/outside storage; skip labels');
             } else {
                 $old=array_values(array_filter(array_map('trim',explode(',',(string)($q['tags']??''))),'strlen'));
@@ -218,7 +226,7 @@ try {
         }
         foreach($titems as $t) {
             $id=(int)$t['id'];$hash=strtolower((string)($t['hash_string']??''));$name=(string)($t['name']??'');
-            $dir=norm((string)($t['download_dir']??'/'));$loc=location($dir,$ssd,$hdd);
+            $dir=norm((string)($t['download_dir']??'/'));$loc=location($dir,$ssd,$hdd,$download);
             $old=array_values(array_filter((array)($t['labels']??[]),'is_string'));
             if(isset($state[$hash])){
                 [$ok,$message]=verifyDestination($t,$state[$hash],$cfg);
@@ -229,12 +237,22 @@ try {
                         if(!$dry&&$moveEnabled){
                             rpc($tr,'torrent_verify',['ids'=>[$id]],$session);
                             $state[$hash]['verify_requested']=true;
+                            $state[$hash]['seen_verifying']=false;
                             saveState($statePath,$state);
                         }
                         continue;
                     }
                     if(in_array((int)($t['status']??-1),[1,2],true)){
+                        if(empty($state[$hash]['seen_verifying'])&&!$dry&&$moveEnabled){
+                            $state[$hash]['seen_verifying']=true;
+                            saveState($statePath,$state);
+                        }
                         say('PENDING '.substr($hash,0,12).' : Transmission verifying');
+                        continue;
+                    }
+                    // Never delete qBittorrent metadata unless a verification phase was actually observed.
+                    if(empty($state[$hash]['seen_verifying'])){
+                        say('PENDING '.substr($hash,0,12).' : verification phase not observed; manual review required');
                         continue;
                     }
                     if((float)($t['percent_done']??0)<0.999999||(int)($t['error']??0)!==0){
@@ -279,7 +297,7 @@ try {
                         say('PREVIEW COMPLETE '.substr($hash,0,12).' : verification and task removal requirements satisfied');
                         continue;
                     }
-                    $fixed=array_values(array_unique(array_merge(array_values(array_diff($old,[$cfg['move_label'],$cfg['ssd_label'],$cfg['hdd_label']])),[$cfg['hdd_label']])));
+                    $fixed=array_values(array_unique(array_merge(array_values(array_diff($old,[$cfg['move_label'],$cfg['ssd_label'],$cfg['download_label'],$cfg['hdd_label']])),[$cfg['hdd_label']])));
                     say(($dry?'PREVIEW COMPLETE':'COMPLETE').' '.substr($hash,0,12).' : '.$message);
                     if(!$dry&&$moveEnabled){
                         if(!sameSet($old,$fixed))rpc($tr,'torrent_set',['ids'=>[$id],'labels'=>$fixed],$session);
@@ -292,7 +310,7 @@ try {
                         say(($dry?'PREVIEW VERIFY':'VERIFY').' '.substr($hash,0,12).' : '.(string)($t['error_string']??''));
                         if(!$dry&&$moveEnabled){
                             rpc($tr,'torrent_verify',['ids'=>[$id]],$session);
-                            $state[$hash]['verify_requested']=true;saveState($statePath,$state);
+                            $state[$hash]['verify_requested']=true;$state[$hash]['seen_verifying']=false;saveState($statePath,$state);
                         }
                     }
                 }
@@ -359,7 +377,7 @@ try {
                 throw new RuntimeException('Insufficient HDD free space for safe move');
             if(!is_dir($host.'/'.$folder)&&!mkdir($host.'/'.$folder,0775,true)&&!is_dir($host.'/'.$folder))throw new RuntimeException('Cannot create site directory');
             // Transmission RPC move=true moves data and changes its download directory.
-            $state[$hash]=['destination'=>$dest,'source'=>$dir,'requested_at'=>date(DATE_ATOM),'verify_requested'=>false,'qbit_hashes'=>$qremove];
+            $state[$hash]=['destination'=>$dest,'source'=>$dir,'requested_at'=>date(DATE_ATOM),'verify_requested'=>false,'seen_verifying'=>false,'qbit_hashes'=>$qremove];
             saveState($statePath,$state);
             rpc($tr,'torrent_set_location',['ids'=>[$id],'location'=>$dest,'move'=>true],$session);
             say('MOVE REQUESTED '.$hash.' ; check again on next run');
