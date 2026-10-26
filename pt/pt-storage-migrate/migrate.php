@@ -139,6 +139,25 @@ function saveState(string $path,array $state): void {
     file_put_contents($tmp,json_encode($state,JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR)."\n");
     if(!rename($tmp,$path))throw new RuntimeException('Cannot save state');
 }
+function observeVerification(array $tr,int $id,string &$session,int $seconds=12): bool {
+    // A fast verification may finish between scheduled runs. Observe it immediately.
+    $until=microtime(true)+$seconds;
+    do {
+        $items=rpc($tr,'torrent_get',['ids'=>[$id],'fields'=>['id','status']],$session)['torrents']??[];
+        if(count($items)===1 && in_array((int)($items[0]['status']??-1),[1,2],true))return true;
+        usleep(250000);
+    } while(microtime(true)<$until);
+    return false; // Fail closed: do not auto-delete qBittorrent metadata.
+}
+function verifiedData(array $t): bool {
+    $total=(int)($t['size_when_done']??0);
+    return $total>0
+        && (int)($t['have_valid']??-1)===$total
+        && (int)($t['have_unchecked']??-1)===0
+        && (int)($t['left_until_done']??-1)===0
+        && (float)($t['percent_done']??0)>=0.999999
+        && !in_array((int)($t['status']??-1),[1,2],true);
+}
 function verifyDestination(array $torrent,array $pending,array $cfg): array {
     $dest=norm($pending['destination']);
     if(norm((string)($torrent['download_dir']??'/'))!==$dest)return [false,'save path not updated'];
@@ -188,7 +207,7 @@ try {
             if(!($status===204||($status===200&&trim($body)==='Ok.')))throw new RuntimeException('qBittorrent login failed: '.$status);
             $qitems=qreq($qb,'torrents/info?filter=all',$cookie,[]);
         }
-        $titems=rpc($tr,'torrent_get',['fields'=>['id','hash_string','name','labels','download_dir','percent_done','files','status','error','error_string']],$session)['torrents']??[];
+        $titems=rpc($tr,'torrent_get',['fields'=>['id','hash_string','name','labels','download_dir','percent_done','files','status','error','error_string','have_valid','have_unchecked','size_when_done','left_until_done']],$session)['torrents']??[];
         say('qBittorrent '.count($qitems).', Transmission '.count($titems).', mode '.($dry?'DRY RUN':'WRITE').', move '.($moveEnabled?'enabled':'disabled'));
         $qpaths=[];$qchanges=0;$tchanges=0;$candidates=0;
         foreach($qitems as $q) {
@@ -237,8 +256,9 @@ try {
                         if(!$dry&&$moveEnabled){
                             rpc($tr,'torrent_verify',['ids'=>[$id]],$session);
                             $state[$hash]['verify_requested']=true;
-                            $state[$hash]['seen_verifying']=false;
+                            $state[$hash]['seen_verifying']=observeVerification($tr,$id,$session);
                             saveState($statePath,$state);
+                            say('VERIFY OBSERVATION '.substr($hash,0,12).' : '.($state[$hash]['seen_verifying']?'verification phase observed':'phase not observed; manual review required'));
                         }
                         continue;
                     }
@@ -255,8 +275,9 @@ try {
                         say('PENDING '.substr($hash,0,12).' : verification phase not observed; manual review required');
                         continue;
                     }
-                    if((float)($t['percent_done']??0)<0.999999||(int)($t['error']??0)!==0){
-                        say('PENDING '.substr($hash,0,12).' : Transmission recheck incomplete or error');
+                    // Tracker errors (e.g. HTTP 404) do not imply corrupted local data.
+                    if(!verifiedData($t)){
+                        say('PENDING '.substr($hash,0,12).' : local hash-verified data incomplete');
                         continue;
                     }
                     // The matching qBittorrent task must still be stopped and complete.
@@ -306,13 +327,8 @@ try {
                 }else{
                     $err=(int)($t['error']??0);
                     say('PENDING '.substr($hash,0,12).' : '.$message.'; status='.(string)($t['status']??'?').'; error='.$err);
-                    if($err!==0&&empty($state[$hash]['verify_requested'])){
-                        say(($dry?'PREVIEW VERIFY':'VERIFY').' '.substr($hash,0,12).' : '.(string)($t['error_string']??''));
-                        if(!$dry&&$moveEnabled){
-                            rpc($tr,'torrent_verify',['ids'=>[$id]],$session);
-                            $state[$hash]['verify_requested']=true;$state[$hash]['seen_verifying']=false;saveState($statePath,$state);
-                        }
-                    }
+                    // Do not trigger verification on tracker errors or incomplete moves.
+                    // Wait for the destination path and physical files to be confirmed.
                 }
                 continue;
             }
@@ -380,7 +396,13 @@ try {
             $state[$hash]=['destination'=>$dest,'source'=>$dir,'requested_at'=>date(DATE_ATOM),'verify_requested'=>false,'seen_verifying'=>false,'qbit_hashes'=>$qremove];
             saveState($statePath,$state);
             rpc($tr,'torrent_set_location',['ids'=>[$id],'location'=>$dest,'move'=>true],$session);
-            say('MOVE REQUESTED '.$hash.' ; check again on next run');
+            $post=rpc($tr,'torrent_get',['ids'=>[$id],'fields'=>['id','download_dir','status']],$session)['torrents']??[];
+            $postDir=count($post)===1?norm((string)($post[0]['download_dir']??'/')):'/';
+            if($postDir===$dest){
+                say('MOVE ACCEPTED '.substr($hash,0,12).' : save path updated; verify physical files next run');
+            }else{
+                say('PENDING MOVE '.substr($hash,0,12).' : save path still '.$postDir.'; no automatic retry to avoid duplicate/partial move');
+            }
         }
         say('Summary: qBit label changes '.$qchanges.', Transmission label changes '.$tchanges.', marked move candidates '.$candidates);
         say('Pending moves: '.count($state).'; file size checks are not full hash verification.');
