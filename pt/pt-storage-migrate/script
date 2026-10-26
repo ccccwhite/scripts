@@ -1,6 +1,5 @@
 #!/bin/bash
 set -euo pipefail
-BASE="/boot/config/plugins/user.scripts/pt-storage-migrate"
-exec 9>"$BASE/run.lock"
-flock -n 9 || exit 0
-/usr/bin/php "$BASE/migrate.php" "$BASE/config.json"
+BASE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Locking belongs to PHP, so manual invocations and this wrapper cannot race.
+exec /usr/bin/php "$BASE/migrate.php" "$BASE/config.json" "$@"
