@@ -393,7 +393,16 @@ try {
                 throw new RuntimeException('Insufficient HDD free space for safe move');
             if(!is_dir($host.'/'.$folder)&&!mkdir($host.'/'.$folder,0775,true)&&!is_dir($host.'/'.$folder))throw new RuntimeException('Cannot create site directory');
             // Transmission RPC move=true moves data and changes its download directory.
-            $state[$hash]=['destination'=>$dest,'source'=>$dir,'requested_at'=>date(DATE_ATOM),'verify_requested'=>false,'seen_verifying'=>false,'qbit_hashes'=>$qremove];
+            $manifest=[];$totalBytes=0;
+            foreach((array)($t['files']??[]) as $file){
+                $fileName=(string)($file['name']??'');
+                $fileLength=(int)($file['length']??-1);
+                if($fileName===''||str_starts_with($fileName,'/')||preg_match('~(^|/)\\.\\.(/|$)~',$fileName)||$fileLength<0)
+                    throw new RuntimeException('Unsafe file manifest for progress monitoring');
+                $manifest[]=['name'=>$fileName,'length'=>$fileLength];
+                $totalBytes+=$fileLength;
+            }
+            $state[$hash]=['destination'=>$dest,'source'=>$dir,'requested_at'=>date(DATE_ATOM),'verify_requested'=>false,'seen_verifying'=>false,'qbit_hashes'=>$qremove,'files'=>$manifest,'total_bytes'=>$totalBytes];
             saveState($statePath,$state);
             rpc($tr,'torrent_set_location',['ids'=>[$id],'location'=>$dest,'move'=>true],$session);
             $post=rpc($tr,'torrent_get',['ids'=>[$id],'fields'=>['id','download_dir','status']],$session)['torrents']??[];
