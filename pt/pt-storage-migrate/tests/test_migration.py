@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import tempfile
 import threading
@@ -41,6 +42,7 @@ class Fixture:
         self.calls = []; self.qreads = 0; self.treads = 0
         self.fail_labels = False; self.fail_delete = False; self.fail_move = False
         self.on_qread = None; self.on_tread = None
+        self.on_move = None
         fixture = self
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_): pass
@@ -69,6 +71,7 @@ class Fixture:
                     if fixture.on_tread: fixture.on_tread(fixture)
                     result = {'torrents': copy.deepcopy([t for t in fixture.t if not params.get('ids') or t['id'] in params['ids']])}
                 elif method == 'torrent_set_location':
+                    if fixture.on_move: fixture.on_move(fixture)
                     if fixture.fail_move:
                         fixture.fail_move = False; self.reply(500, {}); return
                     t = next(t for t in fixture.t if t['id'] in params['ids']); t['download_dir'] = params['location']
@@ -76,7 +79,8 @@ class Fixture:
                         target = fixture.host / params['location'].split('/')[-1] / file['name']
                         target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(b'x' * file['length'])
                 elif method == 'torrent_verify':
-                    fixture.t[0]['status'] = 2
+                    for t in fixture.t:
+                        if t['id'] in params['ids']: t['status'] = 2
                 elif method == 'torrent_set':
                     if fixture.fail_labels:
                         fixture.fail_labels = False; self.reply(500, {}); return
@@ -103,6 +107,25 @@ class Fixture:
         return json.loads(path.read_text()) if path.exists() else {}
     def count(self, method): return sum(call[0] == method for call in self.calls)
     def finish_verify(self): self.t[0]['status'] = 6
+    def workflow_command(self, *options):
+        (self.root / 'config.json').write_text(json.dumps(self.cfg))
+        launcher = self.root / 'php-test'
+        launcher.write_text('#!/bin/sh\nprintf "%s\\n" "$$" >> "$TEST_CHILD_PIDS"\nexec ' + shlex.join(PHP) + ' "$@"\n'); launcher.chmod(0o755)
+        self.env['PHP_BIN'] = str(launcher)
+        self.env['TEST_CHILD_PIDS'] = str(self.root / 'child-pids')
+        return ['bash', str(BASE / 'script'), '--config=' + str(self.root / 'config.json'), '--interval=1', *options]
+    def workflow(self, *options, expected=0):
+        r = subprocess.run(self.workflow_command(*options), env=self.env, text=True, capture_output=True, timeout=25)
+        if r.returncode != expected: raise AssertionError(f'Workflow exit {r.returncode}, wanted {expected}\n{r.stdout}\n{r.stderr}')
+        return r.stdout + r.stderr
+    def auto_verify(self):
+        seen = {}
+        def advance(f):
+            for t in f.t:
+                if t['status'] == 2:
+                    seen[t['id']] = seen.get(t['id'], 0) + 1
+                    if seen[t['id']] >= 2: t['status'] = 6
+        self.on_tread = advance
     def pending(self):
         self.run(); self.run(); self.finish_verify()
     def close(self):
@@ -211,6 +234,65 @@ class MigrationTests(unittest.TestCase):
         finally:
             proc.terminate(); output, error = proc.communicate(timeout=3)
         self.assertIn('~50.0%', output, error); self.assertIn('~100.0%', output, error)
+    def test_workflow_completes_two_tasks_in_one_invocation(self):
+        f = self.f; f.auto_verify()
+        t = copy.deepcopy(f.t[0]); t.update(id=2, hash_string=OTHER, name='other.bin')
+        t['files'] = [dict(name='other.bin', length=4)]; f.t.append(t)
+        output = f.workflow()
+        self.assertFalse(f.state()); self.assertFalse(f.q)
+        self.assertEqual(f.count('torrent_set_location'), 2); self.assertEqual(f.count('torrent_verify'), 2)
+        self.assertTrue(all('move:hdd' not in t['labels'] for t in f.t)); self.assertIn('workflow finished', output)
+    def test_workflow_monitor_runs_during_move_rpc(self):
+        f = self.f; f.auto_verify(); f.on_move = lambda _: time.sleep(1.3)
+        output = f.workflow()
+        self.assertIn('phase move_requested', output); self.assertIn('NOT completion', output); self.assertFalse(f.state())
+    def test_workflow_preview_is_one_pass(self):
+        f = self.f; f.cfg['dry_run'] = True
+        output = f.workflow(); self.assertIn('single pass finished', output)
+        self.assertFalse(f.state()); self.assertEqual(f.treads, 1)
+    def test_workflow_once_retains_pending(self):
+        f = self.f; output = f.workflow('--once')
+        self.assertEqual(f.state()[HASH]['phase'], 'moving'); self.assertEqual(f.count('torrent_verify'), 0)
+    def test_workflow_duplicate_start_is_blocked(self):
+        f = self.f
+        with (f.root / 'workflow.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIn('Another migration workflow', f.workflow()); self.assertFalse(f.calls)
+    def test_workflow_timeout_retains_state(self):
+        f = self.f
+        output = f.workflow('--timeout=1', expected=2)
+        self.assertTrue(f.state()); self.assertIn('Wait timeout', output)
+    def test_workflow_exits_for_unobserved_verification(self):
+        f = self.f; f.pending(); state = f.state(); state[HASH]['seen_verifying'] = False
+        (f.root / 'state.json').write_text(json.dumps(state))
+        output = f.workflow(expected=2)
+        self.assertIn('needs manual review', output); self.assertEqual(f.count('/api/v2/torrents/delete'), 0)
+    def test_workflow_signal_stops_children_and_can_resume(self):
+        self.stop_workflow_and_resume(signal.SIGTERM, 143)
+    def test_workflow_ctrl_c_stops_children_and_can_resume(self):
+        self.stop_workflow_and_resume(signal.SIGINT, 130)
+    def stop_workflow_and_resume(self, signum, expected):
+        f = self.f
+        proc = subprocess.Popen(f.workflow_command(), env=f.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        children = []
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if f.count('torrent_set_location'):
+                    child_file = f.root / 'child-pids'
+                    children = child_file.read_text().split(); break
+                time.sleep(0.05)
+            self.assertTrue(children)
+            proc.send_signal(signum); output, error = proc.communicate(timeout=5)
+            self.assertEqual(proc.returncode, expected, output + error)
+            for pid in children:
+                try: os.kill(int(pid), 0)
+                except ProcessLookupError: continue
+                self.fail('Orphan child: ' + pid)
+            self.assertTrue(f.state())
+            f.auto_verify(); f.workflow(); self.assertFalse(f.state())
+        finally:
+            if proc.poll() is None: os.killpg(proc.pid, signal.SIGKILL); proc.communicate(timeout=5)
 
 
 if __name__ == '__main__': unittest.main(argv=['test_migration.py', *remaining], verbosity=2)

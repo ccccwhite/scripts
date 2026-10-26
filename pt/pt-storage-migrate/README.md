@@ -16,7 +16,7 @@ Transmission 中完成下载且标记 `move:hdd` 的任务，从下载盘迁至 
 
 ## 安装与配置
 
-目录：`/boot/config/plugins/user.scripts/pt-storage-migrate/`。更新时必须同步 `migrate.php`、`progress.php`、`script` 和 README；新版锁在 PHP 内，旧版 `script` 的外层锁会导致新版 PHP 跳过运行。凭据保持在本地公共文件，不要覆盖凭据、`state.json` 或直接覆盖已有本地配置。
+目录：`/boot/config/plugins/user.scripts/pt-storage-migrate/`。更新时同步 `migrate.php`、`progress.php`、`script` 和 README。主程序的 `run.lock` 保护每轮操作，入口的 `workflow.lock` 保护整个持续运行流程；旧版入口的外层 `run.lock` 会导致新版 PHP 跳过运行。凭据保持在本地公共文件，不要覆盖凭据、`state.json` 或直接覆盖已有本地配置。
 
 配置含义：
 
@@ -39,6 +39,19 @@ php -l "$BASE/progress.php"
 bash "$BASE/script"
 ```
 
+`script` 默认集成迁移、进度监控、校验和收尾，无需打开第二个终端。真实迁移模式下，每 3 秒显示磁盘占用估算，并反复调用主程序推进状态。一个任务完成后继续处理下一个符合条件的任务；没有待处理迁移且没有发起新迁移时自动退出。预览模式或禁用移动时只执行一轮。
+
+```bash
+# 默认：一条命令完成流程，包括继续处理已有待完成迁移。
+bash "$BASE/script"
+# 只检查/执行一轮，不等待后续校验和收尾。
+bash "$BASE/script" --once
+# 自定义显示/检查间隔及等待时限（秒，默认最多等待 24 小时）。
+bash "$BASE/script" --interval=3 --timeout=86400
+```
+
+`Ctrl+C` 会退出入口并清理本次启动的监控和 PHP 子进程，保留迁移状态。Transmission 已接受的移动或校验可能仍在后台继续；再次运行同一入口即可检查并继续。接口报错、需要人工确认或等待超时会退出并保留状态；不会自动绕过校验。重复启动入口会被工作流锁拦截。进度显示为磁盘占用估算，无法提供精确复制百分比。
+
 ## 保护与恢复
 
 - 移动前重新读取两个下载器。qBit 同 Hash 任务必须停止且完整，其他共享文件任务会阻止迁移；Transmission 共享文件用路径索引检查。
@@ -59,6 +72,8 @@ php "$BASE/migrate.php" "$BASE/config.json" --retry-move=完整Hash
 php "$BASE/migrate.php" "$BASE/config.json" --recheck=完整Hash
 ```
 
+也可通过集成入口传入上述恢复参数，例如 `bash "$BASE/script" --recheck=完整Hash`。恢复参数仅在第一轮执行，后续只查询和推进状态，避免不断重新发起校验。
+
 部分移动情况下不使用重试命令，先人工核对源与目标文件，避免重复移动。旧版状态会沿用保守规则；旧版在删除 qBit 后中断且没有删除意图记录时，不能自动推断已经安全删除。
 
 非常小的文件可能校验太快，一直无法观察到校验状态。先在 Transmission 手动执行完整校验并确认结束、全部数据完整，再明确执行：
@@ -69,9 +84,11 @@ php "$BASE/migrate.php" "$BASE/config.json" --accept-verified=完整Hash
 
 此命令是人工确认入口，会记录确认时间；仍要求脚本有过校验请求、物理文件完整、Trans 本地校验字段完整，并执行所有 qBit 删除保护。它不自动证明刚刚发生过一次新校验，不应放入定时任务或在未人工确认时使用。
 
-迁移与校验由 Transmission 执行；脚本只在再次运行时推进后续阶段。应定期调用 `script`，或在手动测试后再次运行以完成收尾。
+迁移与校验由 Transmission 执行；集成入口自动重复检查并推进后续阶段。直接调用 `migrate.php` 或使用 `script --once` 时仍仅执行一轮，需要再次运行才能继续收尾。
 
-## 只读监控
+## 可选的独立只读监控
+
+正常使用集成入口无需另外启动监控。只有需要单独查看时才运行：
 
 ```bash
 php "$BASE/progress.php" --watch --interval=3
@@ -93,4 +110,4 @@ python3 tests/test_migration.py
 python3 tests/test_migration.py --php /usr/bin/php
 ```
 
-测试只访问本机模拟接口并使用临时文件，不接触真实下载器。覆盖完整迁移、删除后异常恢复、移动请求失败、部分目标拒绝、共享文件、操作前刷新、锁、映射改变、预览和监控配置。不能替代 Unraid 上的小文件真实迁移验证。
+测试只访问本机模拟接口并使用临时文件，不接触真实下载器。覆盖完整迁移、删除后异常恢复、移动请求失败、部分目标拒绝、共享文件、操作前刷新、锁、映射改变、预览和监控配置，以及集成入口的连续任务、移动请求期间显示、单轮模式、重复启动、超时、人工确认和退出后恢复。不能替代 Unraid 上的小文件真实迁移验证。

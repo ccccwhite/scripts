@@ -4,9 +4,11 @@ declare(strict_types=1);
 define('PT_STORAGE_LIBRARY_ONLY',true);
 require __DIR__.'/migrate.php';
 function fmtBytes(float $bytes): string {return sprintf('%.2f GiB',$bytes/1073741824);}
-$stateFile=null;$configFile=__DIR__.'/config.json';$watch=false;$interval=3;
+$stateFile=null;$configFile=__DIR__.'/config.json';$watch=false;$interval=3;$waitState=false;$quietEmpty=false;
 foreach(array_slice($argv,1) as $arg){
     if($arg==='--watch')$watch=true;
+    elseif($arg==='--wait-state')$waitState=true;
+    elseif($arg==='--quiet-empty')$quietEmpty=true;
     elseif(preg_match('/^--interval=(\d+)$/',$arg,$m))$interval=max(1,min(60,(int)$m[1]));
     elseif(str_starts_with($arg,'--config='))$configFile=substr($arg,9);
     elseif(!str_starts_with($arg,'--')&&$stateFile===null)$stateFile=$arg;
@@ -18,9 +20,9 @@ try {
     $previous=[];
     do {
         clearstatcache();
-        if(!is_file($stateFile))throw new RuntimeException('Missing state file: '.$stateFile);
-        $state=jsonArr((string)file_get_contents($stateFile));$now=microtime(true);
-        if(!$state)say('No pending migrations.');
+        if(!is_file($stateFile)&&!$waitState)throw new RuntimeException('Missing state file: '.$stateFile);
+        $state=is_file($stateFile)?jsonArr((string)file_get_contents($stateFile)):[];$now=microtime(true);
+        if(!$state&&!$quietEmpty)say('No pending migrations.');
         foreach($state as $hash=>$entry){
             try {
                 if(!is_array($entry))throw new RuntimeException('Invalid pending state');

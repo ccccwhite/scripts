@@ -1,5 +1,95 @@
 #!/bin/bash
 set -euo pipefail
 BASE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# Locking belongs to PHP, so manual invocations and this wrapper cannot race.
-exec /usr/bin/php "$BASE/migrate.php" "$BASE/config.json" "$@"
+PHP_BIN="${PHP_BIN:-/usr/bin/php}"
+CONFIG="$BASE/config.json"
+INTERVAL=3
+TIMEOUT=86400
+ONCE=false
+RECOVERY=()
+for arg in "$@"; do
+  case "$arg" in
+    --once) ONCE=true ;;
+    --config=*) CONFIG="${arg#*=}" ;;
+    --interval=*) INTERVAL="${arg#*=}" ;;
+    --timeout=*) TIMEOUT="${arg#*=}" ;;
+    --retry-move=*|--recheck=*|--accept-verified=*) RECOVERY+=("$arg") ;;
+    *) echo "Unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
+[[ "$INTERVAL" =~ ^[1-9][0-9]*$ && ${#INTERVAL} -le 2 ]] && (( INTERVAL <= 60 )) || { echo 'interval must be 1..60 seconds' >&2; exit 1; }
+[[ "$TIMEOUT" =~ ^[1-9][0-9]*$ && ${#TIMEOUT} -le 7 ]] || { echo 'timeout must be a positive number of seconds (up to 7 digits)' >&2; exit 1; }
+if "$ONCE"; then
+  exec "$PHP_BIN" "$BASE/migrate.php" "$CONFIG" "${RECOVERY[@]}"
+fi
+
+# The workflow lock spans all polling passes. Each main-program pass also keeps its run.lock.
+LOCK_DIR=$("$PHP_BIN" -r '
+$c=json_decode(file_get_contents($argv[1]),true,512,JSON_THROW_ON_ERROR);
+echo dirname($c["state_file"]??dirname($argv[1])."/state.json");
+' "$CONFIG")
+[[ ! -L "$LOCK_DIR/workflow.lock" ]] || { echo 'Unsafe workflow lock' >&2; exit 1; }
+exec 8>"$LOCK_DIR/workflow.lock"
+flock -n 8 || { echo 'Another migration workflow is running; skipped'; exit 0; }
+
+MONITOR=''
+WORKER=''
+cleanup() {
+  trap - EXIT INT TERM
+  if [[ -n "$WORKER" ]]; then kill "$WORKER" 2>/dev/null || true; wait "$WORKER" 2>/dev/null || true; fi
+  if [[ -n "$MONITOR" ]]; then kill "$MONITOR" 2>/dev/null || true; wait "$MONITOR" 2>/dev/null || true; fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Count pending work and detect verification that needs explicit human review.
+status() {
+  "$PHP_BIN" -r '
+$c=json_decode(file_get_contents($argv[1]),true,512,JSON_THROW_ON_ERROR);
+$p=$c["state_file"]??dirname($argv[1])."/state.json";
+$s=is_file($p)?json_decode(file_get_contents($p),true,512,JSON_THROW_ON_ERROR):[];
+if(!is_array($s))throw new RuntimeException("Invalid migration state");
+$manual=[];
+foreach($s as $h=>$e)if(!empty($e["verify_requested"])&&empty($e["seen_verifying"])&&empty($e["manual_verification"]))$manual[]=$h;
+printf("%d %d %s\n",count($s),empty($c["dry_run"]??true)&&!empty($c["enable_move"])?1:0,implode(",",$manual));
+' "$CONFIG"
+}
+
+START=$SECONDS
+while true; do
+  read -r BEFORE ENABLED MANUAL < <(status)
+  if (( ENABLED == 1 )) && [[ -z "$MONITOR" ]]; then
+    echo 'Integrated mode: migration + live allocation display + verification + cleanup.'
+    "$PHP_BIN" "$BASE/progress.php" "--config=$CONFIG" --watch --wait-state --quiet-empty "--interval=$INTERVAL" &
+    MONITOR=$!
+  fi
+  "$PHP_BIN" "$BASE/migrate.php" "$CONFIG" "${RECOVERY[@]}" &
+  WORKER=$!
+  if wait "$WORKER"; then RC=0; else RC=$?; fi
+  WORKER=''
+  (( RC == 0 )) || exit "$RC"
+  RECOVERY=() # Recovery requests apply once; never repeatedly restart verification.
+  read -r AFTER ENABLED MANUAL < <(status)
+  if (( ENABLED == 0 )); then echo 'Preview/moves disabled: single pass finished.'; break; fi
+  if [[ -n "$MANUAL" ]]; then
+    echo "Verification observation needs manual review: $MANUAL"
+    echo 'Use --recheck=FULL_HASH, or follow README manual verification instructions.'
+    exit 2
+  fi
+  if (( AFTER == 0 )); then
+    # A completed pending item may have appeared after a skipped candidate in iteration order.
+    if (( BEFORE > 0 )); then continue; fi
+    echo 'Migration workflow finished; no pending migrations.'
+    break
+  fi
+  if ! kill -0 "$MONITOR" 2>/dev/null; then echo 'Progress observer exited unexpectedly; migration state retained.' >&2; exit 1; fi
+  if (( SECONDS - START >= TIMEOUT )); then
+    echo 'Wait timeout reached; state retained. Run this script again to resume.' >&2
+    exit 2
+  fi
+  sleep "$INTERVAL" &
+  WORKER=$!
+  wait "$WORKER"
+  WORKER=''
+done
