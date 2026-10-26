@@ -41,7 +41,7 @@ php -l "$BASE/progress.php"
 bash "$BASE/script"
 ```
 
-`script` 默认集成迁移、进度监控、可选校验和收尾，无需打开第二个终端。真实迁移模式下，每 3 秒显示磁盘占用估算，并反复调用主程序推进状态。一个任务完成后继续处理下一个符合条件的任务；没有待处理迁移且没有发起新迁移时自动退出。预览模式或禁用移动时只执行一轮。
+`script` 默认集成迁移、进度监控、可选校验和收尾，无需打开第二个终端。真实迁移模式下，每 10 秒显示磁盘占用估算，并反复调用主程序推进状态。一个任务完成后继续处理下一个符合条件的任务；没有待处理迁移且没有发起新迁移时自动退出。预览模式或禁用移动时只执行一轮。
 
 ```bash
 # 默认：一条命令完成流程，包括继续处理已有待完成迁移。
@@ -49,7 +49,7 @@ bash "$BASE/script"
 # 只检查/执行一轮，不等待后续校验和收尾。
 bash "$BASE/script" --once
 # 自定义显示/检查间隔及等待时限（秒，默认最多等待 24 小时）。
-bash "$BASE/script" --interval=3 --timeout=86400
+bash "$BASE/script" --interval=10 --timeout=86400
 ```
 
 `Ctrl+C` 会退出入口并清理本次启动的监控和 PHP 子进程，保留迁移状态。Transmission 已接受的移动或校验可能仍在后台继续；再次运行同一入口即可检查并继续。接口报错、需要人工确认或等待超时会退出并保留状态；启用完整校验时不会自动绕过其确认条件。重复启动入口会被工作流锁拦截。进度显示为磁盘占用估算，无法提供精确复制百分比。
@@ -99,7 +99,7 @@ php "$BASE/migrate.php" "$BASE/config.json" --accept-verified=完整Hash
 正常使用集成入口无需另外启动监控。只有需要单独查看时才运行：
 
 ```bash
-php "$BASE/progress.php" --watch --interval=3
+php "$BASE/progress.php" --watch --interval=10
 # 自定义配置，状态路径默认读取配置；也可把状态文件作为位置参数传入。
 php "$BASE/progress.php" --config=/路径/config.json --watch
 ```

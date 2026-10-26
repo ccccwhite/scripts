@@ -3,7 +3,7 @@ set -euo pipefail
 BASE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PHP_BIN="${PHP_BIN:-/usr/bin/php}"
 CONFIG="$BASE/config.json"
-INTERVAL=3
+INTERVAL=10
 TIMEOUT=86400
 ONCE=false
 RECOVERY=()

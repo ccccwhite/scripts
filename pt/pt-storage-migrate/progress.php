@@ -4,7 +4,7 @@ declare(strict_types=1);
 define('PT_STORAGE_LIBRARY_ONLY',true);
 require __DIR__.'/migrate.php';
 function fmtBytes(float $bytes): string {return sprintf('%.2f GiB',$bytes/1073741824);}
-$stateFile=null;$configFile=__DIR__.'/config.json';$watch=false;$interval=3;$waitState=false;$quietEmpty=false;
+$stateFile=null;$configFile=__DIR__.'/config.json';$watch=false;$interval=10;$waitState=false;$quietEmpty=false;
 foreach(array_slice($argv,1) as $arg){
     if($arg==='--watch')$watch=true;
     elseif($arg==='--wait-state')$waitState=true;
