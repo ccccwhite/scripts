@@ -4,3 +4,6 @@
 **/run.lock
 **/*.log
 .DS_Store
+
+# Local development tests (not deployed)
+/pt/pt-storage-migrate/tests/
