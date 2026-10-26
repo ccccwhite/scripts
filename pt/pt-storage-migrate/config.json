@@ -2,6 +2,7 @@
   "dry_run": true,
   "enable_move": false,
   "delete_qbit_after_move": true,
+  "verify_after_move": false,
   "max_pending_moves": 1,
   "credentials_file": "/boot/config/plugins/user.scripts/pt-common/credentials.json",
   "state_file": "/boot/config/plugins/user.scripts/pt-storage-migrate/state.json",

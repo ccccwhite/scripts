@@ -160,6 +160,15 @@ function verifiedData(array $t): bool {
         && (float)($t['percent_done']??0)>=0.999999
         && !in_array((int)($t['status']??-1),[1,2],true);
 }
+function completionReady(array $t,bool $fullRecheck): bool {
+    // A native move preserves Transmission's existing piece state. Do not claim a new hash check.
+    return in_array((int)($t['error']??-1),[0,1,2],true)
+        && (int)($t['size_when_done']??0)>0
+        && (int)($t['left_until_done']??-1)===0
+        && (float)($t['percent_done']??0)>=0.999999
+        && in_array((int)($t['status']??-1),[0,3,4,5,6],true)
+        && (!$fullRecheck||verifiedData($t));
+}
 function verifyDestination(array $torrent,array $pending,array $cfg): array {
     try {
         assertMounted($cfg);pendingMatches($torrent,$pending,$cfg);
@@ -341,7 +350,7 @@ try {
     if(!is_file($credFile))throw new RuntimeException('Local credentials missing');
     $cred=jsonArr((string)file_get_contents($credFile));
     $qb=$cred['qbittorrent'];$tr=$cred['transmission'];
-    foreach(['dry_run','enable_move','delete_qbit_after_move'] as $key)
+    foreach(['dry_run','enable_move','delete_qbit_after_move','verify_after_move'] as $key)
         if(isset($cfg[$key])&&!is_bool($cfg[$key]))throw new RuntimeException($key.' must be a JSON boolean');
     $dry=$cfg['dry_run']??true;$moveEnabled=$cfg['enable_move']??false;
     $cfg['download_path']=$cfg['download_path']??'/download-hdd';
@@ -413,7 +422,7 @@ try {
                         throw new RuntimeException('Retry requires original source path and no verification request');
                     $qitems=qreq($qb,'torrents/info?filter=all',$cookie,$headers);
                     $fresh=transmissionItems($tr,$session);$t=findTorrent($fresh,$hash);$id=(int)$t['id'];
-                    if(norm($t['download_dir'])!==norm($state[$hash]['source'])||!qbitComplete(['progress'=>$t['percent_done']??0,'amount_left'=>$t['left_until_done']??-1]))
+                    if(norm($t['download_dir'])!==norm($state[$hash]['source'])||!completionReady($t,false))
                         throw new RuntimeException('Retry source path/completeness changed');
                     $paths=torrentPaths($t);
                     $shared=sharedTransmission(transmissionIndex($fresh),$paths,$id);
@@ -434,6 +443,7 @@ try {
                     if(in_array((int)$t['status'],[1,2],true))throw new RuntimeException('Verification already running; wait');
                     if(in_array($state[$hash]['phase']??'',['deleting_qbit','qbit_removed'],true))throw new RuntimeException('Deletion already started; resume finalization instead');
                     if(!$dry&&$moveEnabled){
+                        $state[$hash]['force_verify']=true;
                         $state[$hash]['verify_requested']=false;$state[$hash]['seen_verifying']=false;
                         unset($state[$hash]['manual_verification']);saveState($statePath,$state);
                     }else{say('PREVIEW RECHECK '.$hash);continue;}
@@ -443,13 +453,15 @@ try {
                     if(!$valid||empty($state[$hash]['verify_requested'])||!verifiedData($t))
                         throw new RuntimeException('Manual review requires requested and completed verification plus valid destination: '.$why);
                     if(!$dry&&$moveEnabled){
+                        $state[$hash]['force_verify']=true;
                         $state[$hash]['manual_verification']=date(DATE_ATOM);saveState($statePath,$state);
                     }else{say('PREVIEW ACCEPT VERIFIED '.$hash);continue;}
                 }
                 [$ok,$message]=verifyDestination($t,$state[$hash],$cfg);
                 if($ok){
-                    // Do not finalize until Transmission has completed a full hash recheck.
-                    if(empty($state[$hash]['verify_requested'])){
+                    $fullRecheck=($cfg['verify_after_move']??false)||!empty($state[$hash]['force_verify']);
+                    // Native move needs no extra hash pass. Request one only when explicitly enabled.
+                    if($fullRecheck&&empty($state[$hash]['verify_requested'])&&!in_array((int)($t['status']??-1),[1,2],true)){
                         say(($dry?'PREVIEW VERIFY':'VERIFY').' '.substr($hash,0,12).' : destination sizes OK; require hash recheck');
                         if(!$dry&&$moveEnabled){
                             // Persist request intent before RPC; after interruption re-request explicitly with --recheck.
@@ -471,18 +483,18 @@ try {
                         continue;
                     }
                     // Require observed verification, or an explicit audited manual confirmation.
-                    if(empty($state[$hash]['seen_verifying'])&&empty($state[$hash]['manual_verification'])){
+                    if($fullRecheck&&empty($state[$hash]['seen_verifying'])&&empty($state[$hash]['manual_verification'])){
                         say('PENDING '.substr($hash,0,12).' : verification phase not observed; use --recheck=HASH or documented manual review');
                         continue;
                     }
                     // Tracker errors (e.g. HTTP 404) do not imply corrupted local data.
-                    if(!verifiedData($t)){
-                        say('PENDING '.substr($hash,0,12).' : local hash-verified data incomplete');
+                    if(!completionReady($t,$fullRecheck)){
+                        say('PENDING '.substr($hash,0,12).' : local task data incomplete, local error, or verification unfinished');
                         continue;
                     }
                     $t=findTorrent(transmissionItems($tr,$session),$hash);$id=(int)$t['id'];
                     [$freshValid,$why]=verifyDestination($t,$state[$hash],$cfg);
-                    if(!$freshValid||!verifiedData($t))throw new RuntimeException('Destination changed before deletion: '.$why);
+                    if(!$freshValid||!completionReady($t,$fullRecheck))throw new RuntimeException('Destination changed before deletion: '.$why);
                     // The matching qBittorrent task must still be stopped and complete.
                     // Re-evaluate all overlapping qBittorrent paths immediately before deletion.
                     $sourceFiles=[];
@@ -513,17 +525,17 @@ try {
                         }
                     }
                     if($dry||!$moveEnabled){
-                        say('PREVIEW COMPLETE '.substr($hash,0,12).' : verification and task removal requirements satisfied');
+                        say('PREVIEW COMPLETE '.substr($hash,0,12).' : destination and task removal requirements satisfied');
                         continue;
                     }
                     $state[$hash]['phase']='qbit_removed';saveState($statePath,$state);
                     // Preserve labels added by the user while this run was processing other tasks.
                     $t=findTorrent(transmissionItems($tr,$session),$hash);$id=(int)$t['id'];
                     [$stillValid,$why]=verifyDestination($t,$state[$hash],$cfg);
-                    if(!$stillValid||!verifiedData($t))throw new RuntimeException('Destination changed before finalization: '.$why);
+                    if(!$stillValid||!completionReady($t,$fullRecheck))throw new RuntimeException('Destination changed before finalization: '.$why);
                     $old=(array)($t['labels']??[]);
                     $fixed=array_values(array_unique(array_merge(array_values(array_diff($old,[$cfg['move_label'],$cfg['ssd_label'],$cfg['download_label'],$cfg['hdd_label']])),[$cfg['hdd_label']])));
-                    say(($dry?'PREVIEW COMPLETE':'COMPLETE').' '.substr($hash,0,12).' : '.$message);
+                    say(($dry?'PREVIEW COMPLETE':'COMPLETE').' '.substr($hash,0,12).' : '.$message.($fullRecheck?'; full hash recheck confirmed':'; native move confirmed, no extra hash recheck'));
                     if(!$dry&&$moveEnabled){
                         if(!sameSet($old,$fixed))rpc($tr,'torrent_set',['ids'=>[$id],'labels'=>$fixed],$session);
                         unset($state[$hash]);saveState($statePath,$state);
@@ -549,7 +561,7 @@ try {
             $reason=null;
             if($loc===null)$reason='unrecognized storage';
             elseif($loc==='hdd')$reason='already HDD';
-            elseif((float)($t['percent_done']??0)<0.999999)$reason='not completed';
+            elseif(!completionReady($t,false))$reason='not complete, verifying, or local error';
             [$site,$siteError]=inferSite($t,$qitems,$cfg);
             if($siteError!==null)$reason=$siteError;
             $files=[];$invalid=false;
@@ -577,8 +589,7 @@ try {
             $fresh=transmissionItems($tr,$session);$current=findTorrent($fresh,$hash);
             $id=(int)$current['id'];
             if(norm($current['download_dir'])!==$dir||manifest($current)!==manifest($t)
-                ||(float)($current['percent_done']??0)<0.999999||(int)($current['left_until_done']??-1)!==0
-                ||in_array((int)($current['status']??-1),[1,2],true)
+                ||!completionReady($current,false)
                 ||!in_array($cfg['move_label'],(array)($current['labels']??[]),true))
                 throw new RuntimeException('Transmission candidate changed; rerun safely');
             [$freshSite,$siteError]=inferSite($current,$qitems,$cfg);

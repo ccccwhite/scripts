@@ -51,7 +51,7 @@ $p=$c["state_file"]??dirname($argv[1])."/state.json";
 $s=is_file($p)?json_decode(file_get_contents($p),true,512,JSON_THROW_ON_ERROR):[];
 if(!is_array($s))throw new RuntimeException("Invalid migration state");
 $manual=[];
-foreach($s as $h=>$e)if(!empty($e["verify_requested"])&&empty($e["seen_verifying"])&&empty($e["manual_verification"]))$manual[]=$h;
+foreach($s as $h=>$e)if((!empty($c["verify_after_move"])||!empty($e["force_verify"]))&&!empty($e["verify_requested"])&&empty($e["seen_verifying"])&&empty($e["manual_verification"]))$manual[]=$h;
 printf("%d %d %s\n",count($s),empty($c["dry_run"]??true)&&!empty($c["enable_move"])?1:0,implode(",",$manual));
 ' "$CONFIG"
 }
@@ -60,7 +60,7 @@ START=$SECONDS
 while true; do
   read -r BEFORE ENABLED MANUAL < <(status)
   if (( ENABLED == 1 )) && [[ -z "$MONITOR" ]]; then
-    echo 'Integrated mode: migration + live allocation display + verification + cleanup.'
+    echo 'Integrated mode: native migration + live allocation display + optional hash verification + cleanup.'
     "$PHP_BIN" "$BASE/progress.php" "--config=$CONFIG" --watch --wait-state --quiet-empty "--interval=$INTERVAL" &
     MONITOR=$!
   fi

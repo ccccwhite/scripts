@@ -32,7 +32,7 @@ class Fixture:
         self.root = Path(self.tmp.name)
         self.host = self.root / 'disk'; self.host.mkdir()
         self.cfg = json.loads((BASE / 'config.json').read_text())
-        self.cfg.update(dry_run=False, enable_move=True, hdd_host_path=str(self.host),
+        self.cfg.update(dry_run=False, enable_move=True, verify_after_move=True, hdd_host_path=str(self.host),
                         state_file=str(self.root / 'state.json'), credentials_file=str(self.root / 'credentials.json'))
         self.q = [dict(hash=HASH, state='stoppedUP', progress=1, amount_left=0,
                        save_path='/temp/nicept', content_path='/temp/nicept/video.bin', category='nicept', tags='storage:ssd')]
@@ -271,6 +271,34 @@ class MigrationTests(unittest.TestCase):
         self.stop_workflow_and_resume(signal.SIGTERM, 143)
     def test_workflow_ctrl_c_stops_children_and_can_resume(self):
         self.stop_workflow_and_resume(signal.SIGINT, 130)
+    def test_native_move_completes_without_hash_rpc(self):
+        f = self.f; f.cfg['verify_after_move'] = False
+        output = f.workflow()
+        self.assertFalse(f.state()); self.assertFalse(f.q)
+        self.assertEqual(f.count('torrent_verify'), 0); self.assertIn('no extra hash recheck', output)
+    def test_missing_verify_setting_defaults_to_native_move(self):
+        f = self.f; f.cfg.pop('verify_after_move')
+        f.workflow(); self.assertFalse(f.state()); self.assertEqual(f.count('torrent_verify'), 0)
+    def test_native_move_rejects_wrong_destination_size(self):
+        f = self.f; f.cfg['verify_after_move'] = False; f.run()
+        (f.host / 'nicept/video.bin').write_bytes(b'x')
+        f.run(); self.assertTrue(f.state()); self.assertEqual(f.count('/api/v2/torrents/delete'), 0)
+    def test_native_move_rejects_local_error_before_deletion(self):
+        f = self.f; f.cfg['verify_after_move'] = False; f.run(); f.t[0]['error'] = 3
+        f.run(); self.assertTrue(f.state()); self.assertEqual(f.count('/api/v2/torrents/delete'), 0)
+    def test_native_move_accepts_tracker_error(self):
+        f = self.f; f.cfg['verify_after_move'] = False; f.t[0]['error'] = 2
+        f.t[0]['error_string'] = 'Tracker HTTP response 404 (Not Found)'
+        f.workflow(); self.assertFalse(f.state()); self.assertFalse(f.q); self.assertEqual(f.count('torrent_verify'), 0)
+    def test_native_move_waits_for_existing_verification(self):
+        f = self.f; f.cfg['verify_after_move'] = False; f.run(); f.t[0]['status'] = 2
+        f.run(); self.assertTrue(f.state()); self.assertEqual(f.count('/api/v2/torrents/delete'), 0)
+        f.finish_verify(); f.run(); self.assertFalse(f.state()); self.assertEqual(f.count('torrent_verify'), 0)
+    def test_explicit_recheck_persists_in_native_mode(self):
+        f = self.f; f.cfg['verify_after_move'] = False; f.run()
+        f.run('--recheck=' + HASH); self.assertTrue(f.state()[HASH]['force_verify'])
+        self.assertEqual(f.count('torrent_verify'), 1); self.assertTrue(f.q)
+        f.finish_verify(); f.run(); self.assertFalse(f.state())
     def stop_workflow_and_resume(self, signum, expected):
         f = self.f
         proc = subprocess.Popen(f.workflow_command(), env=f.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
