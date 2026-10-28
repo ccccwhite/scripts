@@ -36,6 +36,56 @@ function tagTarget(array $tags, array $allowed): ?string {
     if (count($found) > 1) fail('Multiple target disks selected');
     return $found[0] ?? null;
 }
+/** Preserve the human-readable torrent name, changing only unsafe path characters. */
+function torrentFolder(string $name): string {
+    if (!preg_match('//u', $name)) fail('Invalid UTF-8 torrent name');
+    $clean = preg_replace('/[\/\\\\\x00-\x1F\x7F<>:"|?*]/u', '_', trim($name));
+    if ($clean === null) fail('Cannot normalize torrent name');
+    $clean = rtrim(trim($clean), " .");
+    if ($clean === '' || $clean === '.' || $clean === '..') fail('Empty/unsafe torrent name');
+    // Keep a reasonable single-directory-name byte length without breaking UTF-8.
+    if (strlen($clean) > 180) {
+        preg_match_all('/./us', $clean, $chars);
+        $short = '';
+        foreach ($chars[0] as $ch) {
+            if (strlen($short . $ch) > 180) break;
+            $short .= $ch;
+        }
+        $clean = rtrim($short, " .");
+    }
+    if ($clean === '') fail('Torrent name became empty');
+    return $clean;
+}
+/** Guard against any path already present anywhere in the aggregate share. */
+function occupiedFolder(string $cat, string $folder, array $cfg): bool {
+    $suffix = '/qbit/' . $cat . '/' . $folder;
+    foreach ((array)$cfg['disk_roots'] as $root) {
+        $p = rtrim((string)$root, '/') . $suffix;
+        if (file_exists($p) || is_link($p)) return true;
+    }
+    $ssd = rtrim((string)$cfg['ssd_root'], '/') . $suffix;
+    if (file_exists($ssd) || is_link($ssd)) return true;
+    $shared = rtrim((string)$cfg['share_host_root'], '/') . '/' . $cat . '/' . $folder;
+    return file_exists($shared) || is_link($shared);
+}
+function chooseFolder(string $name, string $cat, string $hash, array $cfg): string {
+    $folder = torrentFolder($name);
+    if (!occupiedFolder($cat, $folder, $cfg)) return $folder;
+    // Only append a short hash in the rare event of a real name collision.
+    foreach ([10, 16, strlen($hash)] as $n) {
+        $suffix = ' [' . substr($hash, 0, $n) . ']';
+        $prefix = $folder;
+        while (strlen($prefix . $suffix) > 220) {
+            // UTF-8 safe last-character removal.
+            $prefix = preg_replace('/.$/us', '', $prefix);
+            if ($prefix === null || $prefix === '') fail('Cannot shorten torrent folder');
+        }
+        $candidate = rtrim($prefix, ' .') . $suffix;
+        if (!occupiedFolder($cat, $candidate, $cfg)) return $candidate;
+    }
+    fail('All candidate paths are occupied; manual review required');
+}
+
 function noLinks(string $path): void {
     $s = '';
     foreach (explode('/', trim($path, '/')) as $piece) {
@@ -59,11 +109,11 @@ function assertDockerMapping(string $container, string $host, string $target): v
     }
     fail('Missing Docker mapping: ' . $host . ' -> ' . $target);
 }
-function checkDestination(string $root, string $cat, string $hash, array $cfg, string $disk, bool $allowExisting): string {
+function checkDestination(string $root, string $cat, string $folder, array $cfg, string $disk, bool $allowExisting): string {
     if (!is_dir($root) || !str_starts_with($root, '/mnt/')) fail('Invalid physical root');
     noLinks($root);
     if ($disk !== 'ssd') physicalMount($root);
-    $suffix = '/qbit/' . $cat . '/' . $hash;
+    $suffix = '/qbit/' . $cat . '/' . $folder;
     foreach ($cfg['disk_roots'] as $d => $r) {
         if ($d === $disk) continue;
         if (file_exists(rtrim($r, '/') . $suffix) || is_link(rtrim($r, '/') . $suffix))
@@ -169,10 +219,15 @@ function processOne(string $hash, array $t, array $cfg, array &$state, array $li
         ($existing['category'] ?? '') !== $cat || ($existing['disk'] ?? '') !== $disk ||
         (int)($existing['size'] ?? 0) !== $size))
         fail('Existing reservation conflicts with requested category/disk/size');
-    $path = checkDestination($root, $cat, $hash, $cfg, $disk, $existing !== null);
+    $folder = $existing !== null
+        ? (string)($existing['folder'] ?? '')
+        : chooseFolder((string)($t['name'] ?? ''), $cat, $hash, $cfg);
+    if ($folder === '' || torrentFolder($folder) !== $folder)
+        fail('Invalid stored torrent folder; manual review required');
+    $path = checkDestination($root, $cat, $folder, $cfg, $disk, $existing !== null);
     $savePath = ($disk === 'ssd' ? rtrim((string)$cfg['ssd_container_root'], '/') :
-        rtrim((string)$cfg['share_container_root'], '/')) . '/qbit/' . $cat . '/' . $hash;
-    if ($disk !== 'ssd') $savePath = rtrim((string)$cfg['share_container_root'], '/') . '/' . $cat . '/' . $hash;
+        rtrim((string)$cfg['share_container_root'], '/')) . '/qbit/' . $cat . '/' . $folder;
+    if ($disk !== 'ssd') $savePath = rtrim((string)$cfg['share_container_root'], '/') . '/' . $cat . '/' . $folder;
     if ($existing === null) {
         $free = disk_free_space($root);
         if ($free === false) fail('Cannot determine free space');
@@ -190,7 +245,7 @@ function processOne(string $hash, array $t, array $cfg, array &$state, array $li
         if (!chown($path, 99) || !chgrp($path, 100) || !chmod($path, 0775))
             fail('Cannot set qBit writable permissions on hash folder');
         $state['jobs'][$hash] = ['disk' => $disk, 'category' => $cat, 'size' => $size,
-            'status' => 'reserved', 'created_at' => time(), 'save_path' => $savePath];
+            'status' => 'reserved', 'created_at' => time(), 'folder' => $folder, 'save_path' => $savePath];
         saveJson((string)$cfg['state_file'], $state); // intent BEFORE qBit write
     }
     $api->post('torrents/setAutoManagement', ['hashes' => $hash, 'enable' => 'false']);
