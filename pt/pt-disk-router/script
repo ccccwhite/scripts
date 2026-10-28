@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+BASE=/boot/config/plugins/user.scripts/pt-disk-router
+mkdir -p /mnt/user/appdata/qbittorrent/pt-router/queue
+/usr/bin/php "$BASE/router.php" "$BASE/config.json" "$@"
