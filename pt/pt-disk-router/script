@@ -1,5 +1,8 @@
 #!/bin/bash
 set -euo pipefail
-BASE=/boot/config/plugins/user.scripts/pt-disk-router
+BASE="/boot/config/plugins/user.scripts/pt-disk-router"
+PHP_BIN="${PHP_BIN:-/usr/bin/php}"
+CONFIG="$BASE/config.json"
+# The PHP main program owns $BASE/run.lock; do not take the same lock here.
 mkdir -p /mnt/user/appdata/qbittorrent/pt-router/queue
-/usr/bin/php "$BASE/router.php" "$BASE/config.json" "$@"
+exec "$PHP_BIN" "$BASE/pt_router.php" "$CONFIG" "$@"
