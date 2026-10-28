@@ -185,6 +185,10 @@ function processOne(string $hash, array $t, array $cfg, array &$state, array $li
     if (!$apply) return 'DRY RUN: would route ' . $cat . ' to ' . $disk . ' as ' . $savePath;
     if ($existing === null) {
         if (!mkdir($path, 0775, true) && !is_dir($path)) fail('Cannot create disk folder');
+        // qBittorrent linuxserver runs as PUID=99, PGID=100. New files must be writable.
+        // Only touch the newly reserved hash directory; never change existing content ownership.
+        if (!chown($path, 99) || !chgrp($path, 100) || !chmod($path, 0775))
+            fail('Cannot set qBit writable permissions on hash folder');
         $state['jobs'][$hash] = ['disk' => $disk, 'category' => $cat, 'size' => $size,
             'status' => 'reserved', 'created_at' => time(), 'save_path' => $savePath];
         saveJson((string)$cfg['state_file'], $state); // intent BEFORE qBit write
