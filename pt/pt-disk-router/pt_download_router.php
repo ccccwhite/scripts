@@ -276,7 +276,7 @@ function processOne(string $hash, array $t, array $cfg, array &$state, array $li
     if (in_array('route:ready', $tags, true)) return 'already ready';
     $allowed = array_merge(array_keys($cfg['disk_roots']), ['ssd']);
     $disk = tagTarget($tags, $allowed);
-    if ($disk === null) return 'waiting for one target:diskN / target:ssd tag';
+    if ($disk === null) return 'SKIP_NO_TARGET';
     $cat = (string)($t['category'] ?? '');
     if (!validCategory($cat)) fail('Invalid or missing category; set mteam/tm18/etc first');
     $epoch = (int)($cfg['activation_epoch'] ?? 0);
@@ -424,9 +424,25 @@ function main(array $argv): void {
         if (!validHash($hash) || !is_file($file) || is_link($file)) continue;
         try {
             if (!isset($live[$hash])) { out(substr($hash, 0, 12) . ' not in qBit; retaining event'); continue; }
+            // Events must contain an add-time target snapshot. Legacy empty
+            // files (from the previous hook) must NEVER become eligible if a
+            // tag is added later. Preserve a separate temporary config for tests.
+            $snapshot = trim((string)file_get_contents($file));
+            if (!preg_match('/^target:(ssd|disk2|disk3|disk6)$/D', $snapshot)) {
+                out(substr($hash, 0, 12) . ' DROP: missing/invalid add-time target snapshot');
+                if ($apply) unlink($file);
+                continue;
+            }
+            $currentTags = parts((string)($live[$hash]['tags'] ?? ''));
+            $currentTarget = tagTarget($currentTags, array_merge(array_keys($cfg['disk_roots']), ['ssd']));
+            if ($currentTarget === null || 'target:' . $currentTarget !== $snapshot) {
+                out(substr($hash, 0, 12) . ' DROP: target changed/removed after add; no routing');
+                if ($apply) unlink($file);
+                continue;
+            }
             $result = processOne($hash, $live[$hash], $cfg, $state, $live, $api, $apply);
             out(substr($hash, 0, 12) . ' ' . $result);
-            if ($apply && (str_starts_with($result, 'READY') || $result === 'already ready')) unlink($file);
+            if ($apply && (str_starts_with($result, 'READY') || $result === 'already ready' || $result === 'SKIP_NO_TARGET')) unlink($file);
         } catch (Throwable $e) {
             out(substr($hash, 0, 12) . ' SKIP: ' . $e->getMessage());
         }
