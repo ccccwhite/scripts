@@ -115,3 +115,16 @@ php "$BASE/progress.php" --config=/路径/config.json --watch
 ## 存储标签统一
 
 本脚本根据明确的容器下载目录进行标签归一化：`/temp` → `storage:ssd`，`/download-hdd` → `storage:disk3`，`/hdd` → `storage:disk2`。删除冗余的旧版 `storage:hdd`、`storage:download-hdd`、`disk:N`、`route:ready` 标签；其他站点标签、`move:hdd` 保持不变。**位于 `/qbit` 的新选盘任务不属于本迁移脚本已知路径，脚本会跳过它们，不会猜测所在磁盘**。若磁盘映射日后发生变化，应先修正代码映射再启用写入；当前映射以仓库 README 为准。`config.json` 中旧 `*_label` 字段仍保留以兼容旧配置，不应再用它们代表统一后的磁盘标识。
+
+## 单独同步 Transmission 存储标签（不执行迁移）
+
+新增 `sync_trans_tags.php`：仅根据 Transmission 容器的**实际 Docker bind 映射**和真实存在的下载目录确认物理磁盘，再把存储标签归一化为 `storage:ssd`、`storage:disk2`、`storage:disk3` 或 `storage:disk6`。保留其他标签（站点分类和 `move:hdd`），删除冗余 `storage:*`、`disk:N` 和 `route:ready`。路径有歧义、目录不存在、容器挂载不明确时跳过；与迁移程序共用运行锁。
+
+```bash
+BASE=/boot/config/plugins/user.scripts/pt-storage-migrate
+php -l "$BASE/sync_trans_tags.php"
+php "$BASE/sync_trans_tags.php"         # 仅预览
+php "$BASE/sync_trans_tags.php" --apply # 审查预览后再执行
+```
+
+此入口不连接 qBittorrent、不调用 Transmission 移动/校验/删除接口，仅显式使用 `--apply` 时更新 Transmission `torrent_set(labels=...)`。它不负责新增 Tracker 站点标签；继续用已有 `pt-category-sync`。**不应将该程序作为自动存储迁移器。**
