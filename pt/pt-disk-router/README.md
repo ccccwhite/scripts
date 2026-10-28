@@ -22,8 +22,8 @@ pt/pt-disk-router/
 2. qBittorrent Docker 新增映射 `/mnt/user/qbit:/qbit:rw`，**保留**旧的 `/temp`、`/hdd`、`/download-hdd`、`/movie` 和 `/config` 映射。
 3. qBittorrent、Qui、MoviePilot/RSS 必须确保**添加时暂停**。关闭“未完成 Torrent 使用其他目录”。新增钩子不是前置拦截器，不能在下载启动后再安全改路径。
 4. 从本目录下载 `pt_download_router.php`、`config.json`、`script` 到 `/boot/config/plugins/user.scripts/pt-disk-router/`；**如果已经存在本地 config.json，不要覆盖**。
-5. 下载 `on-add.sh` 到 `/mnt/user/appdata/qbittorrent/pt-router/on-add.sh`，执行 `chmod 755`；qBit 的“新增 Torrent 时运行外部程序”填写：
-   `/bin/sh /config/pt-router/on-add.sh "%I" "%J"`
+5. 下载 `on-add.sh` 到 `/mnt/user/appdata/qbittorrent/pt-router/on-add.sh`，执行 `chmod 755`；qBit 的“新增 Torrent 时运行外部程序”填写（必须传入新增时的标签 `%G`）：
+   `/bin/sh /config/pt-router/on-add.sh "%I" "%J" "%G"`
 6. `config.json` 的 `activation_epoch` 必须由 `date +%s` 得到实际激活时间，保持 `dry_run:true` 先验证。已存在的旧种子不会处理。
 7. 新任务必须完全暂停、0% 进度、0 下载量，有唯一选盘标签 `target:ssd`、`target:disk2`、`target:disk3` 或 `target:disk6`，且分类合法（如 `mteam`、`tm18`）。
 8. 先运行 `bash /boot/config/plugins/user.scripts/pt-disk-router/script` 预览，确认输出再把 `dry_run` 改成 `false`，**仅人工验证时**运行 `bash /boot/config/plugins/user.scripts/pt-disk-router/script --apply`。未完成真实环境验证前不要配置每分钟自动执行。
@@ -56,7 +56,7 @@ bash "$BASE/script" --apply  # dry_run=false 才会修改路径
 
 ## 实时触发（推荐，取代每分钟 Cron）
 
-Unraid 宿主机需提供 `/usr/bin/inotifywait` 和 `flock`。新增的 `pt_download_watch.sh` 长期运行，监视已有的 qBit `on-add.sh` 队列目录。新 Hash 文件创建后通常约 2 秒启动路由；如果新增时没有 `target:*` 标签，保留事件并每 30 秒重试（支持通过 `PT_DISK_WATCH_RETRY` 改为 5..600 秒）；队列为空时不调用 PHP。
+Unraid 宿主机需提供 `/usr/bin/inotifywait` 和 `flock`。新增的 `pt_download_watch.sh` 长期运行，监视已有的 qBit `on-add.sh` 队列目录。只有新增事件当时已有且只有一个有效 `target:*` 标签，钩子才写入原始标签快照并排队。新增时未指定磁盘的任务不会入队，之后手动加标签也不会处理。合格事件创建后通常约 2 秒启动路由；对于当时已指定磁盘但暂时未就绪的任务，每 30 秒重试（可用 `PT_DISK_WATCH_RETRY` 改为 5..600 秒）；队列为空时不调用 PHP。
 
 下载脚本到 `/boot/config/plugins/user.scripts/pt-disk-router/pt_download_watch.sh`，`chmod 755` 后启动：
 
@@ -77,3 +77,5 @@ nohup /bin/bash "$BASE/pt_download_watch.sh" > "$BASE/watch.log" 2>&1 < /dev/nul
 监听器使用 `/var/run/pt-disk-router-watch.lock` 防重复实例；PHP 路由器继续使用原有锁。切换实时监听前先取消任何旧的每分钟 `pt-disk-router-auto` Cron，避免重复启动。正式路由仍需要 `config.json` 中 `dry_run=false`，以及任务暂停、分类有效、唯一 `target:*` 标签。新增事件不是“完成写入前的拦截器”，不能安全地改动已经自动开始下载的种子；MoviePilot 等下载入口须默认添加暂停。
 
 停止监听器：先用 `pgrep -af '[p]t_download_watch.sh'` 找出实际 PID，然后 `kill PID`；不要删除 `state.json` 或现有下载数据。
+
+**事件入队规则（2026-10）：** 已升级队列文件格式：文件内容为新增当时的 `target:diskN` 或 `target:ssd` 快照。旧版空队列文件被判定无效并清理；更新后必须同时更新 `on-add.sh`、`pt_download_router.php`、qBit 外部程序命令（追加 `%G`）。不保证 qBit 添加事件回调中 `%G` 总会非空；若未包含标签则选择保守跳过，绝不尝试后补标签路由。
