@@ -3,10 +3,10 @@ declare(strict_types=1);
 
 /**
  * PT Disk Router for Unraid 6.12 + qBittorrent 5.x.
- * Host-side PHP; run from User Scripts every minute. FAIL CLOSED.
+ * Host-side PHP; triggered by inotify watcher. FAIL CLOSED.
  *
- * The qBittorrent on-add hook only queues hashes. This program never handles
- * torrents unless they have a queue event and exactly one target:* tag.
+ * The qBittorrent on-add hook records the original target tag. This program
+ * never handles torrents without an add-time snapshot and matching current tag.
  */
 date_default_timezone_set('Asia/Shanghai');
 
@@ -279,6 +279,15 @@ function processOne(string $hash, array $t, array $cfg, array &$state, array $li
     if ($disk === null) return 'SKIP_NO_TARGET';
     $cat = (string)($t['category'] ?? '');
     if (!validCategory($cat)) fail('Invalid or missing category; set mteam/tm18/etc first');
+    // New routes need no route:ready tag: readiness is persisted in state.json.
+    // A leftover/replayed event must not modify a previously completed task.
+    $readyJob = $state['jobs'][$hash] ?? null;
+    if (is_array($readyJob) && ($readyJob['status'] ?? '') === 'ready') {
+        if (($readyJob['category'] ?? '') !== $cat || ($readyJob['disk'] ?? '') !== $disk ||
+            rtrim((string)($readyJob['save_path'] ?? ''), '/') !== rtrim((string)($t['save_path'] ?? ''), '/'))
+            fail('Recorded ready route conflicts with current torrent; manual review required');
+        return 'already ready';
+    }
     $epoch = (int)($cfg['activation_epoch'] ?? 0);
     if ($epoch < 1 || (int)($t['added_on'] ?? 0) < $epoch)
         fail('Not a new task created after activation_epoch');
@@ -379,9 +388,19 @@ function processOne(string $hash, array $t, array $cfg, array &$state, array $li
     $cp = rtrim((string)($confirmedTorrent['content_path'] ?? ''), '/');
     if ($cp !== '' && $cp !== $expectedRoot && !str_starts_with($cp, $expectedRoot . '/'))
         fail('Reported content_path does not match selected root; manual review: ' . $cp);
-    $api->post('torrents/addTags', ['hashes' => $hash, 'tags' => $disk === 'ssd'
-        ? 'storage:ssd,route:ready' : 'storage:hdd,disk:' . substr($disk, 4) . ',route:ready']);
-    $api->post('torrents/removeTags', ['hashes' => $hash, 'tags' => 'target:' . $disk]);
+    // Publish exactly one persistent storage label; leave unrelated site/user tags alone.
+    // Do not expose the internal ready state as an additional qBit UI tag.
+    $storageTag = 'storage:' . $disk;
+    $api->post('torrents/addTags', ['hashes' => $hash, 'tags' => $storageTag]);
+    $obsolete = [];
+    foreach ($tags as $tag) {
+        if (($tag !== $storageTag && str_starts_with($tag, 'storage:')) ||
+            preg_match('/^disk:[0-9]+$/D', $tag) || $tag === 'route:ready' ||
+            $tag === 'target:' . $disk) $obsolete[] = $tag;
+    }
+    if ($obsolete) $api->post('torrents/removeTags', [
+        'hashes' => $hash, 'tags' => implode(',', array_values(array_unique($obsolete)))
+    ]);
     $state['jobs'][$hash]['status'] = 'ready';
     $state['jobs'][$hash]['ready_at'] = time();
     saveJson((string)$cfg['state_file'], $state);
