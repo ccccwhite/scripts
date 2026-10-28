@@ -35,10 +35,21 @@ function location(string $p,string $ssd,string $hdd,string $download): ?string {
     if(within($p,$hdd))return 'hdd';
     return null;
 }
+function storageTag(string $loc,array $cfg): string {
+    return match($loc){
+        'ssd'=>'storage:ssd',
+        'download'=>'storage:disk3',
+        'hdd'=>'storage:disk2',
+        default=>throw new RuntimeException('Unknown storage location')
+    };
+}
 function changeLabels(array $labels,?string $loc,array $cfg): array {
     if($loc===null)return $labels;
-    $out=array_values(array_filter($labels,fn($x)=>!in_array($x,[$cfg['ssd_label'],$cfg['download_label'],$cfg['hdd_label']],true)));
-    $out[]=match($loc){'ssd'=>$cfg['ssd_label'],'download'=>$cfg['download_label'],'hdd'=>$cfg['hdd_label']};
+    $target=storageTag($loc,$cfg);
+    $out=array_values(array_filter($labels,fn($x)=>!str_starts_with((string)$x,'storage:')
+        && !preg_match('/^disk:[0-9]+$/D',(string)$x)
+        && (string)$x!=='route:ready'));
+    $out[]=$target;
     return array_values(array_unique($out));
 }
 function sameSet(array $a,array $b): bool {sort($a);sort($b);return $a===$b;}
@@ -92,7 +103,8 @@ function qbitRemoveTask(array $qb,string $hash,?string $cookie,array $headers): 
 function inferSite(array $t,array $qitems,array $cfg): array {
     $dir=norm((string)($t['download_dir']??'/'));
     $hash=strtolower((string)($t['hash_string']??''));
-    $ignored=array_map('strtolower',[$cfg['ssd_label'],$cfg['download_label'],$cfg['hdd_label'],$cfg['move_label']]);
+    $ignored=array_map('strtolower',[$cfg['ssd_label'],$cfg['download_label'],$cfg['hdd_label'],$cfg['move_label'],
+        'storage:disk2','storage:disk3','storage:disk6','storage:ssd','route:ready','disk:2','disk:3','disk:6']);
     $generic=['qbit','qbittorrent','trans','transmission','download','downloads','complete','completed','incomplete','temp','hdd','ssd'];
     $hints=[];
     foreach((array)($t['labels']??[]) as $label){
@@ -540,7 +552,7 @@ try {
                     [$stillValid,$why]=verifyDestination($t,$state[$hash],$cfg);
                     if(!$stillValid||!completionReady($t,$fullRecheck))throw new RuntimeException('Destination changed before finalization: '.$why);
                     $old=(array)($t['labels']??[]);
-                    $fixed=array_values(array_unique(array_merge(array_values(array_diff($old,[$cfg['move_label'],$cfg['ssd_label'],$cfg['download_label'],$cfg['hdd_label']])),[$cfg['hdd_label']])));
+                    $fixed=changeLabels(array_values(array_filter($old,fn($x)=>$x!==$cfg['move_label'])),'hdd',$cfg);
                     say(($dry?'PREVIEW COMPLETE':'COMPLETE').' '.substr($hash,0,12).' : '.$message.($fullRecheck?'; full hash recheck confirmed':'; native move confirmed, no extra hash recheck'));
                     if(!$dry&&$moveEnabled){
                         if(!sameSet($old,$fixed))rpc($tr,'torrent_set',['ids'=>[$id],'labels'=>$fixed],$session);
