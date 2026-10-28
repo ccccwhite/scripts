@@ -1,82 +1,54 @@
-# PT Disk Router (Unraid + qBittorrent + Qui)
+# PT 手动选盘路由（Unraid / qBittorrent / Qui）
 
-这是**新任务手动选盘**工具，和现有 `pt-storage-migrate` 分离；默认预览、失败即停止，不迁移旧数据、不自动开始下载。
+适用于 Unraid 6.12.13 与 qBittorrent 5.2.x。按任务标签手动选择 SSD、disk2、disk3、disk6，按当前种子分类分目录，保留 `mteam`、`tm18` 等已有分类。**不修改旧任务、不自动开始下载、不移动或删除任何数据。**
 
-## 规则
+## 仓库结构（与其他 PT 脚本一致）
 
-- 分类 `mteam`（普通影视）、`tm18`（9Kg）、其他站点分类，保持不变。
-- 新任务使用**唯一一个** `target:disk2` / `target:disk3` / `target:disk6` / `target:ssd` 标签选盘。
-- HDD 实际目录 `/mnt/diskN/qbit/分类/种子原始名称`；qBit 看到统一目录 `/qbit/分类/种子原始名称`。
-- SSD 继续通过 `/temp/qbit/分类/种子原始名称`。
-- 更新成功后仍暂停，标签变为 `route:ready` 和 `storage:hdd,disk:N`（或 `storage:ssd`）。请人工检查后才启动下载。
-- 每个种子按原始名称创建独立目录，发生重名才追加短 Hash，不复用已经下载的相同资源，**辅种/交叉做种须另行设计**。
-- 不处理旧任务：必须有新增事件队列、有目标标签、加入时间不早于激活时间、处于停止状态、进度和已下载量均为0。
+```text
+pt/pt-disk-router/
+├── pt_router.php   # Unraid 宿主机 PHP 主程序
+├── config.json     # 无密钥的配置示例，下载到本地后按需编辑
+├── script          # Unraid User Scripts 入口
+├── on-add.sh       # qBit 容器内新增 Torrent 钩子
+└── README.md
+```
 
-## Unraid 配置
+统一采用 `config.json`，不再使用 `config.example.json`。运行产生的 `state.json` 和 `run.lock` 在 `/boot/config/plugins/user.scripts/pt-disk-router/`；队列和容器钩子位于 `/mnt/user/appdata/qbittorrent/pt-router/`，因为 qBit 容器已有 `/mnt/user/appdata/qbittorrent:/config` 映射。账号密码继续从已有 `/boot/config/plugins/user.scripts/pt-common/credentials.json` 读取，**不要上传凭据、运行状态或真实敏感配置到 GitHub**。
 
-1. 创建 User Share `qbit`，Primary Storage=Array，Secondary=None；只允许 disk2/disk3/disk6；**Split Level 选择 Manual（不自动拆分目录）**。分配策略仅作为兜底；由宿主机程序在选中盘预先建立专属目录。不要在生产大包上直接测试。
-2. qBit Docker 在原映射基础上**新增** `/mnt/user/qbit:/qbit:rw`，保留旧映射 `/temp`、`/hdd`、`/download-hdd`、`/movie` 和 `/config`。
-3. **务必**将 qBit 的新增 Torrent 默认为停止/暂停，关闭“未完成种子使用其他位置”；Qui / RSS / MoviePilot 各添加入口也必须保证新增时暂停。**on-add 外部程序并不是添加前阻塞钩子**，不能在下载开始后再安全地选盘。
-4. qBit 外部程序勾选“新增 Torrent 时运行”，填写：
+## 安装
+
+1. 确认已存在 `qbit` 用户共享，并设置拆分级别为 **Manual（不自动拆分目录）**；共享包含全部阵列盘也可，但只会开放 `config.json` 中指定的目标供手动选择。其他程序直接写共享仍可能触发不受控放置，避免绕过路由器。
+2. qBittorrent Docker 新增映射 `/mnt/user/qbit:/qbit:rw`，**保留**旧的 `/temp`、`/hdd`、`/download-hdd`、`/movie` 和 `/config` 映射。
+3. qBittorrent、Qui、MoviePilot/RSS 必须确保**添加时暂停**。关闭“未完成 Torrent 使用其他目录”。新增钩子不是前置拦截器，不能在下载启动后再安全改路径。
+4. 从本目录下载 `pt_router.php`、`config.json`、`script` 到 `/boot/config/plugins/user.scripts/pt-disk-router/`；**如果已经存在本地 config.json，不要覆盖**。
+5. 下载 `on-add.sh` 到 `/mnt/user/appdata/qbittorrent/pt-router/on-add.sh`，执行 `chmod 755`；qBit 的“新增 Torrent 时运行外部程序”填写：
    `/bin/sh /config/pt-router/on-add.sh "%I" "%J"`
-   不要选“torrent 完成时运行”。
-5. 在宿主机创建 `/mnt/user/appdata/qbittorrent/pt-router/queue`。部署 `on-add.sh` 到 `/mnt/user/appdata/qbittorrent/pt-router/on-add.sh`，设置权限755。宿主机 `/boot/config/plugins/user.scripts/pt-disk-router/` 放 `router.php`、`script` 和从 `config.example.json` 复制的 `config.json`。
-6. `config.json` 填写 `activation_epoch`（执行 `date +%s` 取得），先保持 `dry_run:true`。使用你已有的私密凭据 `/boot/config/plugins/user.scripts/pt-common/credentials.json`，不要上传该文件。
-7. 添加**全新**小测试 Torrent：类别 `mteam`，单一标签 `target:disk6`，必须暂停且0下载量。
-8. 执行 `bash /boot/config/plugins/user.scripts/pt-disk-router/script`，确认显示 DRY RUN、路径和大小正确。此时没有任何修改。
-9. 手动检查通过后将 `dry_run` 改为 `false`，执行 `bash /boot/config/plugins/user.scripts/pt-disk-router/script --apply`。校验标签 `route:ready`，保存路径 `/qbit/mteam/hash`、物理位置在 disk6，并确认任务仍为暂停。
-10. 测试成功后使用 Unraid User Scripts 将 `script --apply` 设为每分钟执行；先试少量种子，**不要直接在 MoviePilot 自动下载的任务上启用**。
+6. `config.json` 的 `activation_epoch` 必须由 `date +%s` 得到实际激活时间，保持 `dry_run:true` 先验证。已存在的旧种子不会处理。
+7. 新任务必须完全暂停、0% 进度、0 下载量，有唯一选盘标签 `target:ssd`、`target:disk2`、`target:disk3` 或 `target:disk6`，且分类合法（如 `mteam`、`tm18`）。
+8. 先运行 `bash /boot/config/plugins/user.scripts/pt-disk-router/script` 预览，确认输出再把 `dry_run` 改成 `false`，**仅人工验证时**运行 `bash /boot/config/plugins/user.scripts/pt-disk-router/script --apply`。未完成真实环境验证前不要配置每分钟自动执行。
 
-## 检查与停用
+## 目录与做种
+
+- 目标磁盘下会预先建立 `/mnt/diskN/qbit/分类/种子原始名称/`；qBit HDD 统一使用 `/qbit` 访问；SSD 使用 `/temp/qbit/分类`。
+- 路由器读取 qBit Web API 文件清单：若清单中的全部文件已经处在同一个根目录，保持原始根目录不变，保存路径设置到 `/qbit/分类`；否则为平铺文件增加以种子名称命名的外层目录 `/qbit/分类/种子名称`。不会改种子内部相对路径。
+- 平铺文件发生目录重名时会追加短 Hash；已有原始根目录发生冲突则停止处理，**不会擅自改名或覆盖**。
+- 成功后仍暂停，添加 `route:ready`、`storage:ssd` 或 `storage:hdd,disk:N`，并移除 `target:...` 标签。人工检查完成后才启动。
+- 原已有做种路径不会改变。同资源多个 Tracker、辅种共享文件、已有目录冲突、迁移脚本联动尚未适配，**不要用此工具自动处理**。
+- 用户共享路径与磁盘路径不能互相用作复制/移动源和目标。跨磁盘搬运数据时应暂停相关任务，并只在两个不同物理磁盘路径间迁移。
+
+## 常用命令
 
 ```bash
 BASE=/boot/config/plugins/user.scripts/pt-disk-router
-php -l "$BASE/router.php"
+php -l "$BASE/pt_router.php"
 bash -n "$BASE/script"
 bash "$BASE/script" --status
-bash "$BASE/script"            # 预览，即使 dry_run=false
-bash "$BASE/script" --apply    # 仅 dry_run=false 时实际执行
+bash "$BASE/script"          # 即使 dry_run=false 仍为预览
+bash "$BASE/script" --apply  # dry_run=false 才会修改路径
 ```
 
-要停用：取消 qBit 新增 Torrent 外部程序勾选，禁用定时 User Scripts。保留状态文件和目录，不要直接删除队列或清空数据。
+程序默认只预览；出现错误会保留队列和当前状态供人工检查。禁用时请关闭新增钩子并停止 User Scripts 定时执行，**不要删除现有下载目录、队列或状态文件**。
 
-## 注意
+## 生产发布规范
 
-- 当前脚本仅操作新增且完全未下载的任务，不会移动/删除种子文件，不会启动下载。
-- 同一资源多 Tracker 辅种时独立Hash目录会重复占空间；若要共用文件，应另行建立共享文件引用方案。
-- 分享目录不能保证数据冗余：当前无校验盘，硬盘坏掉仍可能丢数据。
-- 未来换盘，保持 `/qbit/分类/种子原始名称` 相对路径一致，暂停种子并在**两条物理盘路径之间**迁移，校验后恢复。切勿在 `/mnt/user/qbit` 与 `/mnt/diskN/qbit` 间相互复制移动同一数据。
-- qBit 分类同步程序应保护 `tm18` 不被 Tracker 自动改回 `mteam`。
-- 现有 `pt-storage-migrate` 尚未适配新共享路径，升级前不要让其处理此路由器的新种子。
-- MoviePilot 应配置路径映射以访问 `/qbit`，且自动添加的任务需保证暂停。
-
-## 目录命名规则（更新）
-
-新种子优先使用 qBittorrent 的**原始种子名称**作为人类可读文件夹名：
-
-```text
-/mnt/disk6/qbit/mteam/The.Shawshank.Redemption.1994.1080p/
-/qbit/mteam/The.Shawshank.Redemption.1994.1080p/
-```
-
-Hash 只用于内部队列、路由状态和重名保护。若任何参与磁盘已经有相同相对路径（包含共享视图），自动追加 `[Hash前10位]` 等后缀，防止覆盖已有文件。名称中的路径分隔符与不安全字符会替换为下划线；超长名称会截短。对于既有数据、交叉辅种及种子自带多级根目录的情况需要额外检查。
-
-**内容布局注意**：qBittorrent 若设置为“创建子文件夹”，且种子文件本身已经带同名根目录，就可能产生 `种子名/种子名` 的双层文件夹。首次测试请核对实际 `content_path`；必要时对新任务使用“不创建子文件夹”的内容布局，并确保该选项不会造成种子文件覆盖或共享。同样的规则必须在 Qui、MoviePilot 的新增界面生效。默认路由脚本不会擅自修改原种子内文件相对路径。
-
-
-## 离线模拟测试（无下载器连接）
-
-测试源码：`tests/simulate.php`。**仅创建临时模拟目录，不连接 qBit、不碰真实种子**。
-
-```bash
-php -l router.php
-php tests/simulate.php
-```
-
-涵盖：单文件无根目录、单文件自带根目录、多文件带根目录、多文件平铺、多根目录、同名加短Hash、原始根目录冲突拒绝、路径穿越、绝对路径、重复文件路径、无元数据、多选目标磁盘。
-
-新种子的真实目录结构以 qBittorrent Web API `torrents/files` 返回的**实际相对文件清单**为依据。已有共同根目录时，qBit 保存路径为 `/qbit/分类`，所选物理磁盘预先创建 `qbit/分类/原始根目录`；平铺文件时，qBit 保存路径为 `/qbit/分类/种子名称`。
-
-**重要限制**：此离线测试只验证目录规划与输入防护，不能证明 qBittorrent 5.2.4 对所有 `content_layout`、`content_path` 配置都正确。必须用暂停测试种子进行真正的 dry-run，并确认真实 `content_path`；尤其是已有根目录与同名资源多 Tracker 辅种的场景。
-
-生产脚本默认不开启数据下载、文件移动或种子恢复；没有经过实际 Unraid 验证前不要启用定时 `--apply`。
+仓库仅提交上述五个文件；不提交模拟 Torrent、测试工具、测试目录、凭据或运行生成的文件。模拟测试已在线下完成，**未验证实际 qBit 5.2.4 的每种布局**，首次生产前仍需要只读检查并用暂停的测试任务验证路径。
