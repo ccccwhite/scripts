@@ -10,6 +10,7 @@ pt/pt-disk-router/
 ├── config.json     # 无密钥的配置示例，下载到本地后按需编辑
 ├── script          # Unraid User Scripts 入口
 ├── on-add.sh       # qBit 容器内新增 Torrent 钩子
+├── pt_download_watch.sh # 宿主机 inotify 实时监听器（可选）
 └── README.md
 ```
 
@@ -52,3 +53,27 @@ bash "$BASE/script" --apply  # dry_run=false 才会修改路径
 ## 生产发布规范
 
 仓库仅提交上述五个文件；不提交模拟 Torrent、测试工具、测试目录、凭据或运行生成的文件。模拟测试已在线下完成，**未验证实际 qBit 5.2.4 的每种布局**，首次生产前仍需要只读检查并用暂停的测试任务验证路径。
+
+## 实时触发（推荐，取代每分钟 Cron）
+
+Unraid 宿主机需提供 `/usr/bin/inotifywait` 和 `flock`。新增的 `pt_download_watch.sh` 长期运行，监视已有的 qBit `on-add.sh` 队列目录。新 Hash 文件创建后通常约 2 秒启动路由；如果新增时没有 `target:*` 标签，保留事件并每 30 秒重试（支持通过 `PT_DISK_WATCH_RETRY` 改为 5..600 秒）；队列为空时不调用 PHP。
+
+下载脚本到 `/boot/config/plugins/user.scripts/pt-disk-router/pt_download_watch.sh`，`chmod 755` 后启动：
+
+```bash
+BASE=/boot/config/plugins/user.scripts/pt-disk-router
+nohup /bin/bash "$BASE/pt_download_watch.sh" > "$BASE/watch.log" 2>&1 < /dev/null &
+pgrep -af '[p]t_download_watch.sh'
+```
+
+建议另建 Unraid User Scripts 启动脚本 `pt-disk-router-watch-start`，Schedule 设 **At Startup of Array**（不设置每分钟 Cron）：
+
+```bash
+#!/bin/bash
+BASE=/boot/config/plugins/user.scripts/pt-disk-router
+nohup /bin/bash "$BASE/pt_download_watch.sh" > "$BASE/watch.log" 2>&1 < /dev/null &
+```
+
+监听器使用 `/var/run/pt-disk-router-watch.lock` 防重复实例；PHP 路由器继续使用原有锁。切换实时监听前先取消任何旧的每分钟 `pt-disk-router-auto` Cron，避免重复启动。正式路由仍需要 `config.json` 中 `dry_run=false`，以及任务暂停、分类有效、唯一 `target:*` 标签。新增事件不是“完成写入前的拦截器”，不能安全地改动已经自动开始下载的种子；MoviePilot 等下载入口须默认添加暂停。
+
+停止监听器：先用 `pgrep -af '[p]t_download_watch.sh'` 找出实际 PID，然后 `kill PID`；不要删除 `state.json` 或现有下载数据。
