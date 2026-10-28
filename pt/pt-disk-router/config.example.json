@@ -1,0 +1,18 @@
+{
+  "dry_run": true,
+  "activation_epoch": 0,
+  "reserve_gib": 100,
+  "credentials_file": "/boot/config/plugins/user.scripts/pt-common/credentials.json",
+  "queue_dir": "/mnt/user/appdata/qbittorrent/pt-router/queue",
+  "state_file": "/mnt/user/appdata/qbittorrent/pt-router/state.json",
+  "lock_file": "/mnt/user/appdata/qbittorrent/pt-router/router.lock",
+  "share_host_root": "/mnt/user/qbit",
+  "share_container_root": "/qbit",
+  "ssd_root": "/mnt/download",
+  "ssd_container_root": "/temp",
+  "disk_roots": {
+    "disk2": "/mnt/disk2",
+    "disk3": "/mnt/disk3",
+    "disk6": "/mnt/disk6"
+  }
+}
