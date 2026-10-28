@@ -6,7 +6,7 @@
 
 ```text
 pt/pt-disk-router/
-├── pt_router.php   # Unraid 宿主机 PHP 主程序
+├── pt_download_router.php   # Unraid 宿主机 PHP 主程序
 ├── config.json     # 无密钥的配置示例，下载到本地后按需编辑
 ├── script          # Unraid User Scripts 入口
 ├── on-add.sh       # qBit 容器内新增 Torrent 钩子
@@ -20,7 +20,7 @@ pt/pt-disk-router/
 1. 确认已存在 `qbit` 用户共享，并设置拆分级别为 **Manual（不自动拆分目录）**；共享包含全部阵列盘也可，但只会开放 `config.json` 中指定的目标供手动选择。其他程序直接写共享仍可能触发不受控放置，避免绕过路由器。
 2. qBittorrent Docker 新增映射 `/mnt/user/qbit:/qbit:rw`，**保留**旧的 `/temp`、`/hdd`、`/download-hdd`、`/movie` 和 `/config` 映射。
 3. qBittorrent、Qui、MoviePilot/RSS 必须确保**添加时暂停**。关闭“未完成 Torrent 使用其他目录”。新增钩子不是前置拦截器，不能在下载启动后再安全改路径。
-4. 从本目录下载 `pt_router.php`、`config.json`、`script` 到 `/boot/config/plugins/user.scripts/pt-disk-router/`；**如果已经存在本地 config.json，不要覆盖**。
+4. 从本目录下载 `pt_download_router.php`、`config.json`、`script` 到 `/boot/config/plugins/user.scripts/pt-disk-router/`；**如果已经存在本地 config.json，不要覆盖**。
 5. 下载 `on-add.sh` 到 `/mnt/user/appdata/qbittorrent/pt-router/on-add.sh`，执行 `chmod 755`；qBit 的“新增 Torrent 时运行外部程序”填写：
    `/bin/sh /config/pt-router/on-add.sh "%I" "%J"`
 6. `config.json` 的 `activation_epoch` 必须由 `date +%s` 得到实际激活时间，保持 `dry_run:true` 先验证。已存在的旧种子不会处理。
@@ -40,7 +40,7 @@ pt/pt-disk-router/
 
 ```bash
 BASE=/boot/config/plugins/user.scripts/pt-disk-router
-php -l "$BASE/pt_router.php"
+php -l "$BASE/pt_download_router.php"
 bash -n "$BASE/script"
 bash "$BASE/script" --status
 bash "$BASE/script"          # 即使 dry_run=false 仍为预览
