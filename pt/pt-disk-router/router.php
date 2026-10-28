@@ -57,9 +57,20 @@ function torrentFolder(string $name): string {
     return $clean;
 }
 /** Guard against any path already present anywhere in the aggregate share. */
+/**
+ * Enumerate ALL array disks, not only the selectable disk_roots map.
+ * A user share can be configured to include additional disks.
+ */
+function allArrayDisks(array $cfg): array {
+    $disks = array_values((array)$cfg['disk_roots']);
+    foreach (glob('/mnt/disk[0-9]*', GLOB_ONLYDIR) ?: [] as $p) {
+        if (preg_match('~^/mnt/disk[0-9]+$~D', $p)) $disks[] = $p;
+    }
+    return array_values(array_unique($disks));
+}
 function occupiedFolder(string $cat, string $folder, array $cfg): bool {
     $suffix = '/qbit/' . $cat . '/' . $folder;
-    foreach ((array)$cfg['disk_roots'] as $root) {
+    foreach (allArrayDisks($cfg) as $root) {
         $p = rtrim((string)$root, '/') . $suffix;
         if (file_exists($p) || is_link($p)) return true;
     }
@@ -71,12 +82,11 @@ function occupiedFolder(string $cat, string $folder, array $cfg): bool {
 function chooseFolder(string $name, string $cat, string $hash, array $cfg): string {
     $folder = torrentFolder($name);
     if (!occupiedFolder($cat, $folder, $cfg)) return $folder;
-    // Only append a short hash in the rare event of a real name collision.
+    // A wrapper directory is under our control: disambiguation is safe.
     foreach ([10, 16, strlen($hash)] as $n) {
         $suffix = ' [' . substr($hash, 0, $n) . ']';
         $prefix = $folder;
         while (strlen($prefix . $suffix) > 220) {
-            // UTF-8 safe last-character removal.
             $prefix = preg_replace('/.$/us', '', $prefix);
             if ($prefix === null || $prefix === '') fail('Cannot shorten torrent folder');
         }
@@ -84,6 +94,65 @@ function chooseFolder(string $name, string $cat, string $hash, array $cfg): stri
         if (!occupiedFolder($cat, $candidate, $cfg)) return $candidate;
     }
     fail('All candidate paths are occupied; manual review required');
+}
+/** Verify the qBit API's actual *relative file paths*, without rewriting them. */
+function torrentManifest(array $files): array {
+    if (!$files) fail('Torrent metadata not yet available');
+    if (count($files) > 200000) fail('Excessive torrent file count');
+    $manifest = [];
+    foreach ($files as $f) {
+        if (!is_array($f)) fail('Invalid qBit torrent file entry');
+        $name = $f['name'] ?? null;
+        $size = $f['size'] ?? null;
+        if (!is_string($name) || !is_int($size) || $size < 0 || $name === '' ||
+            !preg_match('//u', $name) || str_contains($name, '\\') ||
+            str_starts_with($name, '/') || preg_match('/[\x00-\x1F\x7F]/', $name))
+            fail('Unsafe torrent file path from qBit API');
+        $segments = explode('/', $name);
+        foreach ($segments as $seg) {
+            if ($seg === '' || $seg === '.' || $seg === '..' || strlen($seg) > 255)
+                fail('Unsafe torrent directory component');
+        }
+        if (isset($manifest[$name])) fail('Duplicate file paths in torrent');
+        $manifest[$name] = $size;
+    }
+    ksort($manifest, SORT_STRING);
+    return $manifest;
+}
+/**
+ * If ALL torrent files already have the same original top-level directory,
+ * use category as qBit save_path and precreate that root on the selected disk.
+ *
+ * Otherwise provide a single human-readable wrapper folder for the flat files.
+ * Never rename torrent-internal paths and never create a redundant root/root.
+ */
+function planTorrentLayout(array $torrent, array $files, array $cfg, string $cat, string $hash): array {
+    $manifest = torrentManifest($files);
+    $first = null;
+    $sharedRoot = true;
+    foreach (array_keys($manifest) as $relative) {
+        $segments = explode('/', $relative);
+        if (count($segments) < 2) { $sharedRoot = false; break; }
+        if ($first === null) $first = $segments[0];
+        elseif ($first !== $segments[0]) { $sharedRoot = false; break; }
+    }
+    if ($sharedRoot && $first !== null) {
+        // The root folder is owned by the torrent's content layout and cannot
+        // be transparently renamed without changing the torrent file paths.
+        $folder = $first;
+        if (occupiedFolder($cat, $folder, $cfg))
+            fail('Existing torrent root path collides with data on disk: ' . $cat . '/' . $folder .
+                '; do not auto-rename the original root (manual review required)');
+        $mode = 'existing_root';
+    } else {
+        $folder = chooseFolder((string)($torrent['name'] ?? ''), $cat, $hash, $cfg);
+        $mode = 'wrapper';
+    }
+    return [
+        'layout_version' => 2, 'layout_mode' => $mode, 'folder' => $folder,
+        'manifest_sha256' => hash('sha256', json_encode($manifest, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR)),
+        'file_count' => count($manifest),
+    ];
 }
 
 function noLinks(string $path): void {
@@ -114,14 +183,15 @@ function checkDestination(string $root, string $cat, string $folder, array $cfg,
     noLinks($root);
     if ($disk !== 'ssd') physicalMount($root);
     $suffix = '/qbit/' . $cat . '/' . $folder;
-    foreach ($cfg['disk_roots'] as $d => $r) {
-        if ($d === $disk) continue;
+    foreach (allArrayDisks($cfg) as $r) {
+        $d = basename($r);
+        if ($r === $root) continue;
         if (file_exists(rtrim($r, '/') . $suffix) || is_link(rtrim($r, '/') . $suffix))
-            fail('Same hash folder exists on another disk: ' . $d);
+            fail('Same torrent destination exists on another disk: ' . $d);
     }
     if ($disk !== 'ssd' && isset($cfg['ssd_root'])) {
         if (file_exists(rtrim($cfg['ssd_root'], '/') . $suffix) || is_link(rtrim($cfg['ssd_root'], '/') . $suffix))
-            fail('Same hash folder exists on SSD');
+            fail('Same torrent destination exists on SSD');
     }
     $path = rtrim($root, '/') . $suffix;
     noLinks($path);
@@ -219,15 +289,35 @@ function processOne(string $hash, array $t, array $cfg, array &$state, array $li
         ($existing['category'] ?? '') !== $cat || ($existing['disk'] ?? '') !== $disk ||
         (int)($existing['size'] ?? 0) !== $size))
         fail('Existing reservation conflicts with requested category/disk/size');
-    $folder = $existing !== null
-        ? (string)($existing['folder'] ?? '')
-        : chooseFolder((string)($t['name'] ?? ''), $cat, $hash, $cfg);
-    if ($folder === '' || torrentFolder($folder) !== $folder)
-        fail('Invalid stored torrent folder; manual review required');
+    // Read actual qBit file paths, including any root folder from the torrent layout.
+    // Only target tasks that are stopped and have zero progress / downloaded bytes.
+    $files = $api->get('torrents/files?hash=' . rawurlencode($hash));
+    $manifest = torrentManifest($files);
+    if ($existing !== null) {
+        if (($existing['layout_version'] ?? 0) !== 2) fail('Old reservation format; manual review required');
+        $plan = [
+            'layout_version' => 2,
+            'layout_mode' => (string)$existing['layout_mode'],
+            'folder' => (string)$existing['folder'],
+            'manifest_sha256' => (string)$existing['manifest_sha256'],
+            'file_count' => (int)$existing['file_count']
+        ];
+        $signature = hash('sha256', json_encode($manifest, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
+        if ($signature !== $plan['manifest_sha256'] || count($manifest) !== $plan['file_count'])
+            fail('Torrent file list changed after reservation');
+    } else {
+        $plan = planTorrentLayout($t, $files, $cfg, $cat, $hash);
+    }
+    $folder = $plan['folder'];
+    if ($folder === '' || str_contains($folder, '/') || in_array($folder, ['.','..'], true))
+        fail('Invalid stored torrent root; manual review required');
     $path = checkDestination($root, $cat, $folder, $cfg, $disk, $existing !== null);
-    $savePath = ($disk === 'ssd' ? rtrim((string)$cfg['ssd_container_root'], '/') :
-        rtrim((string)$cfg['share_container_root'], '/')) . '/qbit/' . $cat . '/' . $folder;
-    if ($disk !== 'ssd') $savePath = rtrim((string)$cfg['share_container_root'], '/') . '/' . $cat . '/' . $folder;
+    $base = $disk === 'ssd'
+        ? rtrim((string)$cfg['ssd_container_root'], '/') . '/qbit/' . $cat
+        : rtrim((string)$cfg['share_container_root'], '/') . '/' . $cat;
+    $savePath = $plan['layout_mode'] === 'existing_root'
+        ? $base
+        : $base . '/' . $folder;
     if ($existing === null) {
         $free = disk_free_space($root);
         if ($free === false) fail('Cannot determine free space');
@@ -237,7 +327,7 @@ function processOne(string $hash, array $t, array $cfg, array &$state, array $li
             fail('Insufficient space; required=' . round(($size + $margin + $reserved) / 1073741824, 1) .
                 'GiB free=' . round($free / 1073741824, 1) . 'GiB');
     }
-    if (!$apply) return 'DRY RUN: would route ' . $cat . ' to ' . $disk . ' as ' . $savePath;
+    if (!$apply) return 'DRY RUN: would route ' . $cat . ' to ' . $disk . ' [' . $plan['layout_mode'] . ', ' . $plan['file_count'] . ' files] as ' . $savePath . ' (physical root: ' . $path . ')';
     if ($existing === null) {
         if (!mkdir($path, 0775, true) && !is_dir($path)) fail('Cannot create disk folder');
         // qBittorrent linuxserver runs as PUID=99, PGID=100. New files must be writable.
@@ -245,7 +335,10 @@ function processOne(string $hash, array $t, array $cfg, array &$state, array $li
         if (!chown($path, 99) || !chgrp($path, 100) || !chmod($path, 0775))
             fail('Cannot set qBit writable permissions on hash folder');
         $state['jobs'][$hash] = ['disk' => $disk, 'category' => $cat, 'size' => $size,
-            'status' => 'reserved', 'created_at' => time(), 'folder' => $folder, 'save_path' => $savePath];
+            'status' => 'reserved', 'created_at' => time(), 'folder' => $folder,
+            'layout_mode' => $plan['layout_mode'], 'layout_version' => 2,
+            'file_count' => $plan['file_count'], 'manifest_sha256' => $plan['manifest_sha256'],
+            'save_path' => $savePath];
         saveJson((string)$cfg['state_file'], $state); // intent BEFORE qBit write
     }
     $api->post('torrents/setAutoManagement', ['hashes' => $hash, 'enable' => 'false']);
@@ -261,6 +354,22 @@ function processOne(string $hash, array $t, array $cfg, array &$state, array $li
         usleep(250000);
     }
     if (!$confirmed) fail('qBit save_path not confirmed; reservation preserved; torrent must remain stopped');
+    // After moving the empty task, verify qBittorrent did not silently change
+    // its effective torrent-relative paths, which would alter the content layout.
+    $afterFiles = torrentManifest($api->get('torrents/files?hash=' . rawurlencode($hash)));
+    $afterSignature = hash('sha256', json_encode($afterFiles, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
+    if ($afterSignature !== $plan['manifest_sha256'])
+        fail('File layout changed during location update; manual review required');
+    $fresh = $api->get('torrents/info?filter=all');
+    $confirmedTorrent = null;
+    foreach ($fresh as $item)
+        if (strtolower((string)($item['hash'] ?? '')) === $hash) $confirmedTorrent = $item;
+    if ($confirmedTorrent === null || !hasNoContent($confirmedTorrent))
+        fail('Torrent started or received data during routing; DO NOT mark ready');
+    $expectedRoot = $base . '/' . $folder;
+    $cp = rtrim((string)($confirmedTorrent['content_path'] ?? ''), '/');
+    if ($cp !== '' && $cp !== $expectedRoot && !str_starts_with($cp, $expectedRoot . '/'))
+        fail('Reported content_path does not match selected root; manual review: ' . $cp);
     $api->post('torrents/addTags', ['hashes' => $hash, 'tags' => $disk === 'ssd'
         ? 'storage:ssd,route:ready' : 'storage:hdd,disk:' . substr($disk, 4) . ',route:ready']);
     $api->post('torrents/removeTags', ['hashes' => $hash, 'tags' => 'target:' . $disk]);
@@ -314,4 +423,6 @@ function main(array $argv): void {
         }
     }
 }
-try { main($argv); } catch (Throwable $e) { fwrite(STDERR, 'ERROR: ' . $e->getMessage() . PHP_EOL); exit(1); }
+if (!defined('PT_DISK_ROUTER_TEST')) {
+    try { main($argv); } catch (Throwable $e) { fwrite(STDERR, 'ERROR: ' . $e->getMessage() . PHP_EOL); exit(1); }
+}
