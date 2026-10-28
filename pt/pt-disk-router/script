@@ -5,4 +5,4 @@ PHP_BIN="${PHP_BIN:-/usr/bin/php}"
 CONFIG="$BASE/config.json"
 # The PHP main program owns $BASE/run.lock; do not take the same lock here.
 mkdir -p /mnt/user/appdata/qbittorrent/pt-router/queue
-exec "$PHP_BIN" "$BASE/pt_router.php" "$CONFIG" "$@"
+exec "$PHP_BIN" "$BASE/pt_download_router.php" "$CONFIG" "$@"
