@@ -9,8 +9,8 @@ Transmission 中完成下载且标记 `move:hdd` 的任务，从下载盘迁至 
 | 宿主机 | 容器路径 | 用途 | 存储标签 |
 | --- | --- | --- | --- |
 | `/mnt/download` | `/temp` | SSD 下载 | `storage:ssd` |
-| `/mnt/disk3` | `/download-hdd` | Disk 3 下载 | `storage:download-hdd` |
-| `/mnt/disk2` | `/hdd` | Disk 2 长期保种 | `storage:hdd` |
+| `/mnt/disk3` | `/download-hdd` | Disk 3 下载 | `storage:disk3` |
+| `/mnt/disk2` | `/hdd` | Disk 2 长期保种 | `storage:disk2` |
 
 `hdd_path` 决定 Transmission 移动到哪里，`hdd_host_path` 决定宿主机检查哪里，两者必须对应同一挂载。脚本检查目标挂载点与符号链接，但不自动读取 Docker 配置验证映射。不要在迁移期间修改映射、重命名文件、恢复 qBit 源任务或操作同一批数据。
 
@@ -111,3 +111,7 @@ php "$BASE/progress.php" --config=/路径/config.json --watch
 ## 验证说明
 
 开发回归测试仅在本地保留，不随运行脚本上传或部署。生产运行不依赖 tests 目录。发布前的模拟测试不能替代 Unraid 上的实际迁移验证。
+
+## 存储标签统一
+
+本脚本根据明确的容器下载目录进行标签归一化：`/temp` → `storage:ssd`，`/download-hdd` → `storage:disk3`，`/hdd` → `storage:disk2`。删除冗余的旧版 `storage:hdd`、`storage:download-hdd`、`disk:N`、`route:ready` 标签；其他站点标签、`move:hdd` 保持不变。**位于 `/qbit` 的新选盘任务不属于本迁移脚本已知路径，脚本会跳过它们，不会猜测所在磁盘**。若磁盘映射日后发生变化，应先修正代码映射再启用写入；当前映射以仓库 README 为准。`config.json` 中旧 `*_label` 字段仍保留以兼容旧配置，不应再用它们代表统一后的磁盘标识。
