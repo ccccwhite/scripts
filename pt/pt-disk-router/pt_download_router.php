@@ -220,6 +220,7 @@ function hasNoContent(array $t): bool {
 class Qbit {
     private string $base;
     private string $sid = '';
+    private string $cookieName = '';
     public function __construct(array $creds) {
         $this->base = rtrim((string)($creds['url'] ?? ''), '/');
         if (!preg_match('~^https?://[a-zA-Z0-9.:-]+$~', $this->base)) fail('Invalid qBit URL');
@@ -227,23 +228,28 @@ class Qbit {
             'username' => (string)($creds['username'] ?? $creds['user'] ?? ''),
             'password' => (string)($creds['password'] ?? $creds['pass'] ?? '')
         ], true);
-        if ($this->sid === '') fail('Login cookie missing; check qBit auth');
+        // A successful qBit 5.2 login may be 204 (No Content).
+        // Authentication bypass can omit a cookie, so verify real API access.
+        $this->get('torrents/info?filter=all');
     }
     public function request(string $verb, string $ep, array $fields = [], bool $login = false): string {
         $url = $this->base . '/api/v2/' . $ep;
         $ch = curl_init($url);
         if ($ch === false) fail('curl_init failed');
-        $origin = preg_replace('~/[^/]*$~', '', $this->base);
         $headers = ['Referer: ' . $this->base . '/', 'Origin: ' . $this->base,
             'Content-Type: application/x-www-form-urlencoded'];
-        if ($this->sid !== '') $headers[] = 'Cookie: SID=' . $this->sid;
+        if ($this->sid !== '' && $this->cookieName !== '')
+            $headers[] = 'Cookie: ' . $this->cookieName . '=' . $this->sid;
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT => 5,
             CURLOPT_TIMEOUT => 15, CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_PROXY => '', CURLOPT_NOPROXY => '*',
             CURLOPT_HTTPHEADER => $headers,
             CURLOPT_HEADERFUNCTION => function ($ch, string $line): int {
-                if (preg_match('/^Set-Cookie:\s*SID=([^;\s]+)/i', $line, $m)) $this->sid = $m[1];
+                if (preg_match('/^Set-Cookie:\s*(SID|QBT_SID_[0-9]+)=([^;\s]+)/i', $line, $m)) {
+                    $this->cookieName = $m[1];
+                    $this->sid = $m[2];
+                }
                 return strlen($line);
             }
         ]);
@@ -251,8 +257,11 @@ class Qbit {
         $body = curl_exec($ch);
         $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $err = curl_error($ch); curl_close($ch);
-        if ($body === false || $code !== 200) fail('qBit ' . $ep . ' failed HTTP ' . $code . ' ' . $err);
-        if ($login && trim((string)$body) !== 'Ok.') fail('qBit login rejected');
+        $validStatus = $login
+            ? in_array($code, [200, 204], true)
+            : ($verb === 'POST' ? in_array($code, [200, 204], true) : $code === 200);
+        if ($body === false || !$validStatus) fail('qBit ' . $ep . ' failed HTTP ' . $code . ' ' . $err);
+        if ($login && $code === 200 && trim((string)$body) !== 'Ok.') fail('qBit login rejected');
         if (!$login && trim((string)$body) === 'Fails.') fail('qBit rejected request: ' . $ep);
         return (string)$body;
     }
