@@ -33,7 +33,7 @@ pt/pt-disk-router/
 - 目标磁盘下会预先建立 `/mnt/diskN/qbit/分类/种子原始名称/`；qBit HDD 统一使用 `/qbit` 访问；SSD 使用 `/temp/qbit/分类`。
 - 路由器读取 qBit Web API 文件清单：若清单中的全部文件已经处在同一个根目录，保持原始根目录不变，保存路径设置到 `/qbit/分类`；否则为平铺文件增加以种子名称命名的外层目录 `/qbit/分类/种子名称`。不会改种子内部相对路径。
 - 平铺文件发生目录重名时会追加短 Hash；已有原始根目录发生冲突则停止处理，**不会擅自改名或覆盖**。
-- 成功后仍暂停，添加 `route:ready`、`storage:ssd` 或 `storage:hdd,disk:N`，并移除 `target:...` 标签。人工检查完成后才启动。
+- 成功后仍暂停，仅添加一个持久标签 `storage:ssd` 或 `storage:disk2` / `storage:disk3` / `storage:disk6`，并移除 `target:...` 及旧的 `route:ready`、`disk:N`、冗余 `storage:*` 标签。完成状态保存在 `state.json`，不再通过 `route:ready` 标记。人工检查完成后才启动。
 - 原已有做种路径不会改变。同资源多个 Tracker、辅种共享文件、已有目录冲突、迁移脚本联动尚未适配，**不要用此工具自动处理**。
 - 用户共享路径与磁盘路径不能互相用作复制/移动源和目标。跨磁盘搬运数据时应暂停相关任务，并只在两个不同物理磁盘路径间迁移。
 
@@ -79,3 +79,7 @@ nohup /bin/bash "$BASE/pt_download_watch.sh" > "$BASE/watch.log" 2>&1 < /dev/nul
 停止监听器：先用 `pgrep -af '[p]t_download_watch.sh'` 找出实际 PID，然后 `kill PID`；不要删除 `state.json` 或现有下载数据。
 
 **事件入队规则（2026-10）：** 已升级队列文件格式：文件内容为新增当时的 `target:diskN` 或 `target:ssd` 快照。旧版空队列文件被判定无效并清理；更新后必须同时更新 `on-add.sh`、`pt_download_router.php`、qBit 外部程序命令（追加 `%G`）。不保证 qBit 添加事件回调中 `%G` 总会非空；若未包含标签则选择保守跳过，绝不尝试后补标签路由。
+
+## 存储标签规范（2026-10）
+
+持久标签只使用 `storage:ssd`、`storage:disk2`、`storage:disk3`、`storage:disk6`；新增事件仍使用一次性的 `target:ssd` / `target:diskN`。旧 `storage:hdd`、`storage:download-hdd`、`disk:N` 和 `route:ready` 不再由路由器产生。状态保存在 `state.json`。旧任务不会由路由器批量改标签；应先审计再独立清理，不要用标签替代物理文件路径判断。
