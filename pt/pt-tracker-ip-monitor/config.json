@@ -23,8 +23,11 @@
   ],
   "max_candidates": 12,
   "probe_timeout_seconds": 3,
-  "min_failed_trackers": 3,
+  "min_failed_trackers": 1,
   "failed_ratio": 0.7,
   "consecutive_bad_runs": 2,
-  "min_switch_interval_seconds": 3600
+  "min_switch_interval_seconds": 3600,
+  "sample_torrents_per_tracker": 2,
+  "probe_settle_seconds": 180,
+  "min_reannounce_interval_seconds": 1800
 }
