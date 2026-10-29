@@ -10,18 +10,15 @@
     "mteam",
     "mt18"
   ],
-  "candidate_ipv4": [
-    "104.17.24.14",
-    "104.17.25.14",
-    "104.16.123.96",
-    "104.16.124.96"
-  ],
   "dns_sources": [
+    "tracker.m-team.cc",
+    "tracker.m-team.io",
+    "tra1.m-team.cc",
+    "tra1.m-team.io",
     "www.cloudflare.com",
-    "cdnjs.cloudflare.com",
-    "tracker.m-team.cc"
+    "cdnjs.cloudflare.com"
   ],
-  "max_candidates": 12,
+  "max_candidates": 20,
   "probe_timeout_seconds": 3,
   "min_failed_trackers": 1,
   "failed_ratio": 0.7,
