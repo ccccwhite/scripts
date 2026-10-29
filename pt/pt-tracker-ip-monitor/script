@@ -1,0 +1,4 @@
+#!/bin/bash
+set -euo pipefail
+BASE="/boot/config/plugins/user.scripts/pt-tracker-ip-monitor"
+exec /usr/bin/php "$BASE/pt_tracker_ip_monitor.php" "${1:---preview}" "$BASE/config.json"
