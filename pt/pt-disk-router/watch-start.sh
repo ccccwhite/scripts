@@ -1,4 +1,5 @@
 #!/bin/bash
+#name=pt-disk-router-watch-start
 # Unraid User Scripts entry: pt-disk-router-watch-start
 set -euo pipefail
 BASE="/boot/config/plugins/user.scripts/pt-disk-router"
