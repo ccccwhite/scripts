@@ -12,7 +12,7 @@
 - 只维护目标域名 `tracker.m-team.cc`。检测到 Docker `extra_hosts`、`--add-host` 或第三方未管理的同域名记录时拒绝覆盖。修改之前预检查两个容器；第二个失败时尝试回滚。
 - `/etc/hosts` 运行时写入**不会跨容器重建持久化**。已选 IP 存在本地 `state.json`，每次 `--apply` 会先同步恢复至两个运行中的容器，避免容器重建后长期丢失。切换不重启容器，也不关闭 IPv6 Peer。
 - 监测不会强制 Tracker announce，更不会删除、停止或移动种子。若候选 IP 被 Cloudflare WAF 拒绝，即使 TLS 通过也可能无法汇报，需人工验证。
-- 候选 IPv4 和 DNS 采集来源在 `config.json` 配置。修改的是解析目标 IP，而非 Tracker URL；只需这两个 Docker 使用，无需改 Unraid 全局网络。
+- 不再保存固定候选 IPv4：仅在抽样重新汇报确认失败后，从 `config.json` 的 `dns_sources` 实时查询 A 记录，去重并从两个容器直连验证；若无可用候选，保持原 IP 不变。DNS 查询结果并不自动等于 Tracker 可用。
 - 正式启用前不建议另开 `pt-tracker-failover` 写入模式。M-Team 官方 CF 线路参考：https://wiki.m-team.cc/zh-tw/cf-choose-better-ip
 
 ## 重新汇报限流
