@@ -1,0 +1,20 @@
+{
+  "dns_groups": {
+    "cloudflare": [
+      "www.cloudflare.com",
+      "cdnjs.cloudflare.com"
+    ]
+  },
+  "sites": {
+    "mteam": {
+      "trackers": [
+        "tracker.m-team.cc",
+        "tracker.m-team.io",
+        "tra1.m-team.cc",
+        "tra1.m-team.io",
+        "tra99.manfuz.co"
+      ],
+      "dns_group": "cloudflare"
+    }
+  }
+}
