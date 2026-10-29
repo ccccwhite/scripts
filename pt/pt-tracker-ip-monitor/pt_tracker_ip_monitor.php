@@ -1,13 +1,10 @@
 <?php
-/**
- * PT Tracker Failover for Unraid 6.12 / qBittorrent 5.3 / Transmission 4.1.
- * Only GET APIs and unauthenticated direct HTTPS reachability probes in preview.
- * In apply mode, only changes tracker URLs, never torrents or payloads.
- */
+/** PT Tracker IP monitor: reannounce <=2 sample torrents per domain across both clients; confirm fresh results before IP switch. */
 declare(strict_types=1);
 date_default_timezone_set('Asia/Shanghai');
 
 function say(string $s): void { echo '[' . date('Y-m-d H:i:s') . '] ' . $s . PHP_EOL; }
+function asjson(string $s): array { $v=json_decode($s,true,512,JSON_THROW_ON_ERROR);if(!is_array($v))throw new RuntimeException('Invalid JSON');return $v; }
 function jsonFile(string $p): array {
     if (!is_file($p) || is_link($p)) throw new RuntimeException('JSON file missing or unsafe: ' . $p);
     $x=json_decode((string)file_get_contents($p),true,512,JSON_THROW_ON_ERROR);
@@ -105,6 +102,10 @@ final class Qbit {
             throw new RuntimeException('qBit '.$endpoint.' HTTP '.$code.' rejected');
         return $body;
     }
+    public function reannounce(string $hash,string $url): void {
+        // Web API 5.x supports selecting one tracker URL; never announce all torrents.
+        $this->request('POST','torrents/reannounce',['hashes'=>$hash,'urls'=>$url]);
+    }
     public function get(string $ep): array {
         $v=json_decode($this->request('GET',$ep),true,512,JSON_THROW_ON_ERROR);
         if (!is_array($v)) throw new RuntimeException('Invalid qBit API response');
@@ -142,6 +143,10 @@ final class Transmission {
         }
         throw new RuntimeException('Transmission session handshake failed');
     }
+    public function reannounce(string $hash): void {
+        // Transmission 4.1 RPC: ids is mandatory to avoid all-torrents reannounce.
+        $this->rpc('torrent_reannounce',['ids'=>[$hash]]);
+    }
     public function list(): array {
         $r=$this->rpc('torrent_get',['fields'=>['hash_string','name','tracker_list']]);
         $map=[];
@@ -162,36 +167,113 @@ const IP_MONITOR_TAG = '# PT-TRACKER-IP-MONITOR';
 function hasNetError(string $message): bool {
     return (bool)preg_match('/timed?\s*out|timeout|could not connect|connection (refused|reset|failed)|unreachable|stream truncated|network error|connection error|couldn.t resolve|name resolution|no route/i',$message);
 }
-function qbitStats(Qbit $qb,string $host,array $categories): array {
-    $counts=['ok'=>0,'bad'=>0,'unknown'=>0,'checked'=>0];
-    foreach($qb->get('torrents/info?filter=all') as $t) {
-        if(!in_array(strtolower((string)($t['category']??'')),$categories,true)
-            && endpointHost((string)($t['tracker']??''))!==$host)continue;
-        $hash=(string)($t['hash']??'');
-        if(!preg_match('/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/Di',$hash))continue;
-        foreach($qb->get('torrents/trackers?hash='.rawurlencode($hash)) as $tr){
+
+/** Health statistics are based on ACTIVE torrents only; stopped torrents carry stale failures. */
+function qbitAudit(Qbit $qb,string $host,array $cats): array {
+    $stats=['ok'=>0,'bad'=>0,'unknown'=>0,'checked'=>0,'stopped'=>0];$samples=[];
+    foreach($qb->get('torrents/info?filter=all') as $t){
+        if(!in_array(strtolower((string)($t['category']??'')),$cats,true)
+           && endpointHost((string)($t['tracker']??''))!==$host)continue;
+        $hash=strtolower((string)($t['hash']??''));
+        if(!preg_match('/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/D',$hash))continue;
+        $state=(string)($t['state']??'');
+        foreach($qb->get('torrents/trackers?hash='.$hash) as $tr){
             if(endpointHost((string)($tr['url']??''))!==$host)continue;
-            $counts['checked']++;$s=(int)($tr['status']??-1);
-            if($s===2)$counts['ok']++;
-            elseif($s===4&&hasNetError((string)($tr['msg']??'')))$counts['bad']++;
-            else $counts['unknown']++;
+            if(str_starts_with($state,'stopped')){$stats['stopped']++;continue;}
+            $stats['checked']++;$code=(int)($tr['status']??-1);
+            if($code===2)$stats['ok']++;
+            elseif(in_array($code,[4,5,6],true)&&hasNetError((string)($tr['msg']??''))){
+                $stats['bad']++;
+                $samples[]=['client'=>'qbit','hash'=>$hash,'name'=>(string)($t['name']??''),
+                    'tracker_url'=>(string)($tr['url']??''),
+                    'baseline_next'=>(int)($tr['next_announce']??0),
+                    'rank'=>str_ends_with($state,'DL')?0:1];
+            }else $stats['unknown']++;
         }
     }
-    return $counts;
+    usort($samples,fn($x,$y)=>$x['rank']<=>$y['rank']);
+    return [$stats,$samples];
 }
-function transStats(Transmission $tr,string $host): array {
-    $r=$tr->rpc('torrent_get',['fields'=>['hash_string','tracker_stats']]);
-    $counts=['ok'=>0,'bad'=>0,'unknown'=>0,'checked'=>0];
-    foreach($r['torrents']??[] as $t)foreach($t['tracker_stats']??[] as $v){
-        if(endpointHost((string)($v['announce']??''))!==$host)continue;
-        $counts['checked']++;
-        if(($v['has_announced']??false)!==true){$counts['unknown']++;continue;}
-        if(($v['last_announce_succeeded']??false)===true)$counts['ok']++;
-        elseif(($v['last_announce_timed_out']??false)===true||
-               hasNetError((string)($v['last_announce_result']??'')))$counts['bad']++;
-        else $counts['unknown']++;
+function transAudit(Transmission $tr,string $host): array {
+    $data=$tr->rpc('torrent_get',['fields'=>['hash_string','name','status','tracker_stats']]);
+    $stats=['ok'=>0,'bad'=>0,'unknown'=>0,'checked'=>0,'stopped'=>0];$samples=[];
+    foreach($data['torrents']??[] as $t){
+        $hash=strtolower((string)($t['hash_string']??''));
+        if(!preg_match('/^[a-f0-9]{40}$/D',$hash))continue;
+        $trackers=(array)($t['tracker_stats']??[]);
+        foreach($trackers as $v){
+            if(endpointHost((string)($v['announce']??''))!==$host)continue;
+            if((int)($t['status']??0)===0){$stats['stopped']++;continue;}
+            $stats['checked']++;
+            if(!($v['has_announced']??false)){$stats['unknown']++;continue;}
+            if(($v['last_announce_succeeded']??false)===true)$stats['ok']++;
+            elseif(($v['last_announce_timed_out']??false)===true||
+                   hasNetError((string)($v['last_announce_result']??''))){
+                $stats['bad']++;
+                // Transmission reannounce targets every tracker for ONE torrent.
+                // Only select single-host tracker torrents.
+                $other=false;
+                foreach($trackers as $entry){
+                    $h=endpointHost((string)($entry['announce']??''));
+                    if($h!==''&&$h!==$host){$other=true;break;}
+                }
+                if(!$other)$samples[]=['client'=>'transmission','hash'=>$hash,
+                    'name'=>(string)($t['name']??''),
+                    'baseline_last'=>(int)($v['last_announce_time']??0)];
+            }else $stats['unknown']++;
+        }
     }
-    return $counts;
+    return [$stats,$samples];
+}
+function selectSamples(array $q,array $t,int $max): array {
+    $out=[];
+    if($q)$out[]=$q[0];
+    if(count($out)<$max&&$t)$out[]=$t[0];
+    foreach([$q,$t] as $arr)for($i=1;$i<count($arr)&&count($out)<$max;$i++)$out[]=$arr[$i];
+    return array_slice($out,0,$max);
+}
+/** A stale failed status is NOT proof of a fresh failed reannounce. */
+function probeResults(array $samples,Qbit $qb,Transmission $tr,string $host,int $settle): array {
+    $ok=0;$fail=0;$pending=0;$details=[];
+    $transMap=[];
+    if(array_filter($samples,fn($x)=>($x['client']??'')==='transmission')){
+        $data=$tr->rpc('torrent_get',['fields'=>['hash_string','tracker_stats']]);
+        foreach($data['torrents']??[] as $t)$transMap[strtolower((string)($t['hash_string']??''))]=$t;
+    }
+    foreach($samples as $s){
+        $client=(string)($s['client']??'');$hash=(string)($s['hash']??'');
+        $start=(int)($s['started']??0);$result='pending';
+        if($start>0&&time()-$start>=$settle){
+            if($client==='qbit'){
+                $data=$qb->get('torrents/trackers?hash='.rawurlencode($hash));
+                foreach($data as $v)if(endpointHost((string)($v['url']??''))===$host){
+                    $code=(int)($v['status']??-1);
+                    $updating=$code===3;
+                    foreach($v['endpoints']??[] as $e)if(($e['updating']??false)===true)$updating=true;
+                    // next_announce is an epoch timestamp on the user's 5.3 client.
+                    $fresh=(int)($v['next_announce']??0)>0 &&
+                           (int)($v['next_announce']??0)!==(int)($s['baseline_next']??0);
+                    if($fresh&&!$updating&&$code===2)$result='ok';
+                    elseif($fresh&&!$updating&&in_array($code,[4,5,6],true)&&
+                          hasNetError((string)($v['msg']??'')))$result='fail';
+                    break;
+                }
+            }elseif($client==='transmission'){
+                foreach(($transMap[$hash]['tracker_stats']??[]) as $v){
+                    if(endpointHost((string)($v['announce']??''))!==$host)continue;
+                    $last=(int)($v['last_announce_time']??0);
+                    $fresh=$last>(int)($s['baseline_last']??0)&&$last>=$start-5;
+                    if($fresh&&($v['last_announce_succeeded']??false)===true)$result='ok';
+                    elseif($fresh&&(($v['last_announce_timed_out']??false)===true||
+                         hasNetError((string)($v['last_announce_result']??''))))$result='fail';
+                    break;
+                }
+            }
+        }
+        $details[]=$client.' '.substr($hash,0,10).' '.$result;
+        if($result==='ok')$ok++;elseif($result==='fail')$fail++;else $pending++;
+    }
+    return [$ok,$fail,$pending,$details];
 }
 function dockerCmd(string $container,array $cmd,?string $stdin=null): string {
     if(!preg_match('/^[A-Za-z0-9][A-Za-z0-9_.-]{0,100}$/D',$container))
@@ -278,7 +360,7 @@ function syncHosts(array $containers,string $host,string $ip,bool $apply): bool 
         if($old[$container]!==$target[$container])$changed=true;
     }
     if(!$changed)return false;
-    logmsg(($apply?'APPLY ':'PREVIEW ').'hosts '.$host.' -> '.$ip.' in '.implode(', ',$containers));
+    say(($apply?'APPLY ':'PREVIEW ').'hosts '.$host.' -> '.$ip.' in '.implode(', ',$containers));
     if(!$apply)return true;
     $written=[];
     try{
@@ -289,7 +371,7 @@ function syncHosts(array $containers,string $host,string $ip,bool $apply): bool 
     }catch(Throwable $e){
         foreach(array_reverse($written) as $container){
             try{writeHosts($container,$old[$container]);}
-            catch(Throwable $rollback){logmsg('ROLLBACK FAILED '.$container.': '.$rollback->getMessage());}
+            catch(Throwable $rollback){say('ROLLBACK FAILED '.$container.': '.$rollback->getMessage());}
         }
         throw $e;
     }
@@ -299,76 +381,126 @@ try{
     $mode=$argv[1]??'--preview';
     if(!in_array($mode,['--preview','--status','--apply'],true))
         throw new RuntimeException('Usage: script --preview|--status|--apply');
-    $cfg=asjson((string)file_get_contents($argv[2]??__DIR__.'/config.json'));
+    $cfg=jsonFile($argv[2]??__DIR__.'/config.json');
     if(!is_bool($cfg['dry_run']??null))throw new RuntimeException('dry_run must be boolean');
     $apply=$mode==='--apply';
     if($apply&&$cfg['dry_run'])throw new RuntimeException('dry_run=true: refusing --apply');
     $host=strtolower((string)($cfg['tracker_domain']??''));
     if(!preg_match('/^[a-z0-9.-]+$/D',$host))throw new RuntimeException('Invalid tracker domain');
-    $containers=[(string)($cfg['qbittorrent_container']??'qbittorrent'),(string)($cfg['transmission_container']??'transmission')];
+    $containers=[(string)($cfg['qbittorrent_container']??'qbittorrent'),
+                 (string)($cfg['transmission_container']??'transmission')];
     if(count(array_unique($containers))!==2)throw new RuntimeException('Container names must differ');
     $lockPath=(string)($cfg['lock_file']??__DIR__.'/run.lock');
     if(is_link($lockPath))throw new RuntimeException('Symlink run.lock');
     $lock=fopen($lockPath,'c');
-    if(!$lock||!flock($lock,LOCK_EX|LOCK_NB)){logmsg('Already running, skipping');exit(0);}
+    if(!$lock||!flock($lock,LOCK_EX|LOCK_NB)){say('Already running; skipped');exit(0);}
     $stateFile=(string)($cfg['state_file']??__DIR__.'/state.json');
-    $state=is_file($stateFile)?asjson((string)file_get_contents($stateFile)):
-        ['bad_runs'=>0,'current_ip'=>'','last_switch'=>0];
-    $current=(string)($state['current_ip']??'');
+    $state=is_file($stateFile)?jsonFile($stateFile):
+        ['current_ip'=>'','last_switch'=>0,'last_probe'=>0,'samples'=>[]];
+    $state+=['current_ip'=>'','last_switch'=>0,'last_probe'=>0,'samples'=>[]];
+    $current=(string)$state['current_ip'];
     if($mode==='--status'){
-        logmsg('domain='.$host.' current_ip='.($current?:'none').
-            ' bad_runs='.($state['bad_runs']??0).' last_switch='.($state['last_switch']??0));
+        say('domain='.$host.' current_ip='.($current?:'none').
+            ' pending_samples='.count((array)$state['samples']).
+            ' last_probe='.$state['last_probe'].' last_switch='.$state['last_switch']);
         exit(0);
     }
-    $creds=asjson((string)file_get_contents((string)($cfg['credentials_file']??'')));
+    $creds=jsonFile((string)($cfg['credentials_file']??''));
     $qb=new Qbit($creds['qbittorrent']??[]);
     $tr=new Transmission($creds['transmission']??[]);
-    $q=qbitStats($qb,$host,(array)($cfg['categories']??[]));
-    $t=transStats($tr,$host);
+    [$q,$qSamples]=qbitAudit($qb,$host,(array)($cfg['categories']??[]));
+    [$t,$tSamples]=transAudit($tr,$host);
     foreach(['qBittorrent'=>$q,'Transmission'=>$t] as $name=>$x)
-        logmsg($name.' checked='.$x['checked'].' ok='.$x['ok'].' network_fail='.$x['bad'].' unknown='.$x['unknown']);
-    $min=max(2,(int)($cfg['min_failed_trackers']??3));
-    $ratio=max(0.1,min(1,(float)($cfg['failed_ratio']??0.7)));
-    $bad=fn(array $a)=>$a['bad']>=$min&&($a['bad']+$a['ok'])>=$min
-        &&$a['bad']/($a['bad']+$a['ok']) >= $ratio;
-    $ill=$bad($q)||$bad($t);
-    $runs=$ill?(int)($state['bad_runs']??0)+1:0;
-    logmsg('Health '.($ill?'FAIL':'OK').' consecutive_bad_runs='.$runs);
-    // Container recreation removes runtime hosts: heal saved mapping in every apply.
+        say($name.' active='.$x['checked'].' ok='.$x['ok'].
+            ' network_fail='.$x['bad'].' unknown='.$x['unknown'].
+            ' stopped_skipped='.$x['stopped']);
+    // Repair saved mapping if Docker recreated the two containers.
     if($current!==''&&filter_var($current,FILTER_VALIDATE_IP,FILTER_FLAG_IPV4))
         syncHosts($containers,$host,$current,$apply);
-    $required=max(1,(int)($cfg['consecutive_bad_runs']??2));
-    $cooldown=max(600,(int)($cfg['min_switch_interval_seconds']??3600));
-    if(!$ill||$runs<$required){
-        logmsg('No switch (healthy or waiting for consecutive failures)');
-        if($apply){$state['bad_runs']=$runs;stateSave($stateFile,$state);}exit(0);
+
+    $min=max(1,(int)($cfg['min_failed_trackers']??1));
+    $ratio=max(0.1,min(1.0,(float)($cfg['failed_ratio']??0.7)));
+    $isBad=fn($v)=>$v['bad']>=$min&&
+        $v['bad']/max(1,$v['bad']+$v['ok']) >= $ratio;
+    $suspected=$isBad($q)||$isBad($t);
+    $samples=(array)$state['samples'];
+    $settle=max(60,min(1800,(int)($cfg['probe_settle_seconds']??180)));
+    if(!$suspected) {
+        say('Tracker healthy; no reannounce or IP switch');
+        if($apply){$state['samples']=[];stateSave($stateFile,$state);}
+        exit(0);
     }
+    if(!$samples){
+        // At most 1-2 total samples per Tracker, preferably one per client.
+        $sampleMax=max(1,min(2,(int)($cfg['sample_torrents_per_tracker']??2)));
+        $samples=selectSamples($qSamples,$tSamples,$sampleMax);
+        say('Potential network problem: '.($q['bad']+$t['bad']).
+            ' failed active trackers. Selected '.count($samples).' sample(s), NOT all torrents');
+        foreach($samples as $s)say('SAMPLE '.$s['client'].' '.substr($s['hash'],0,12).' '.substr(str_replace(["\r","\n"],' ',(string)$s['name']),0,80));
+        if(!$samples){say('No active failed sample available; cannot confirm error');exit(0);}
+        $gap=max(900,(int)($cfg['min_reannounce_interval_seconds']??1800));
+        if(time()-(int)$state['last_probe']<$gap){
+            say('Reannounce cooldown active; no action');exit(0);
+        }
+        if(!$apply){say('Preview only: next --apply reannounces <=2 samples');exit(0);}
+        // Save write-ahead intent and lock out repeats before sending any announce.
+        $state['last_probe']=time();$state['samples']=[];
+        stateSave($stateFile,$state);
+        $sent=[];
+        try{
+            foreach($samples as $s){
+                $s['started']=time();
+                // Store no URL/Passkey on disk.
+                if($s['client']==='qbit')
+                    $qb->reannounce($s['hash'],$s['tracker_url']);
+                else $tr->reannounce($s['hash']);
+                unset($s['tracker_url'],$s['name'],$s['rank']);
+                $sent[]=$s;
+                $state['samples']=$sent;
+                stateSave($stateFile,$state);
+                say('REANNOUNCE '.$s['client'].' '.substr($s['hash'],0,12).' requested');
+            }
+        }catch(Throwable $e){
+            say('Reannounce request error: '.$e->getMessage().
+                ' ; sent samples saved for later verification');
+            exit(1);
+        }
+        say('Will verify fresh results on next scheduled check; no IP changed now');
+        exit(0);
+    }
+    [$ok,$fail,$pending,$details]=probeResults($samples,$qb,$tr,$host,$settle);
+    foreach($details as $detail)say('VERIFY '.$detail);
+    if($pending>0){say('Awaiting fresh tracker replies; no IP change');exit(0);}
+    if($ok>0){
+        say('At least one sample recovered; no IP change');
+        if($apply){$state['samples']=[];stateSave($stateFile,$state);}
+        exit(0);
+    }
+    if($fail===0){say('No confirmed sample failure; no IP change');exit(0);}
+    say('CONFIRMED: '.$fail.' fresh sample announce failure(s). Testing alternate IPs.');
+    $cooldown=max(600,(int)($cfg['min_switch_interval_seconds']??3600));
     if(time()-(int)($state['last_switch']??0)<$cooldown){
-        logmsg('No switch (cooldown)');
-        if($apply){$state['bad_runs']=$runs;stateSave($stateFile,$state);}exit(0);
+        say('IP switch cooldown; keeping current IP');exit(0);
     }
     $best='';$score=INF;$timeout=max(2,min(10,(int)($cfg['probe_timeout_seconds']??3)));
     foreach(candidates($cfg) as $ip){
         if($ip===$current)continue;
-        $ok=true;$sum=0;$details=[];
+        $pass=true;$sum=0;$details=[];
         foreach($containers as $container){
             [$good,$duration]=probeIP($container,$host,$ip,$timeout);
             $details[]=$container.'='.($good?'PASS':'FAIL');
-            if(!$good)$ok=false;
+            if(!$good)$pass=false;
             $sum+=$duration;
         }
-        logmsg('Probe '.$ip.' '.implode(' ',$details).($ok?' TLS_total='.round($sum,3).'s':''));
-        if($ok&&$sum<$score){$best=$ip;$score=$sum;}
+        say('PROBE '.$ip.' '.implode(' ',$details).($pass?' TLS_total='.round($sum,3).'s':''));
+        if($pass&&$sum<$score){$best=$ip;$score=$sum;}
     }
-    if($best===''){
-        logmsg('No IP passed TLS from both clients; keeping mappings unchanged');
-        if($apply){$state['bad_runs']=$runs;stateSave($stateFile,$state);}exit(1);
-    }
-    logmsg('Preferred IPv4 '.$best.' (TLS proof only; announce not guaranteed)');
+    if($best===''){say('No alternate IP passed TLS; current IP unchanged');exit(1);}
+    say('Preferred IP='.$best.' (TLS only; announce verification still needed)');
     syncHosts($containers,$host,$best,$apply);
     if($apply){
-        $state['current_ip']=$best;$state['last_switch']=time();$state['bad_runs']=0;
+        $state['current_ip']=$best;$state['last_switch']=time();$state['samples']=[];
         stateSave($stateFile,$state);
-        logmsg('Updated both containers without changing any torrent URL. Await natural announce.');
-    }else logmsg('Preview only: no changes made');
+        say('Updated both containers. Future runs will sample announce again if failures persist.');
+    }else say('Preview only; no IP changed');
 }catch(Throwable $e){fwrite(STDERR,'ERROR: '.$e->getMessage().PHP_EOL);exit(1);}
