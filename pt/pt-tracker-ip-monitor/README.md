@@ -1,63 +1,45 @@
-# PT Tracker IP Monitor — qBittorrent + Transmission
+# PT Tracker IP Monitor（qBittorrent + Transmission）
 
-适配 Unraid 6.12.13、qBittorrent 5.3.0、Transmission 4.1.3。**两个客户端同时定期检查** `tracker.m-team.cc`，连续判定网络异常时测试 Cloudflare 候选 IPv4，然后同步更新**两个 Docker 容器的运行时 `/etc/hosts`**，保留全部 Torrent Tracker URL、Passkey、路径、标签。与已有更换 Tracker URL 的 `pt-tracker-failover` 不同，两个方案不要同时启用 `--apply`。
+适用 Unraid 6.12.13 / qBittorrent 5.3.x / Transmission 4.1.x。自动从两个客户端种子中**发现 HTTPS Tracker 域名**，不预设某个 Tracker。只对异常域名挑选最多 2 个运行中的种子（优先两端各 1 个）重新汇报，等待新的汇报结果；再次确认异常，才从 DNS 实时查询候选 IPv4、双容器直连测试，并可同步更新两容器运行时 `/etc/hosts`。**不修改种子 Tracker URL、Passkey、文件或标签。**
 
-## 默认安全条件
-- `dry_run: true`；`--preview` 只读，不触发重新汇报。启用 `--apply` 后才对样本发起重新汇报。
-- 必须成功读取 **qBittorrent 与 Transmission** 的 API，任何一端不可用即中止。
-- qBit 检查目标域名各条种子的 Tracker 状态；状态 4 且消息属于 timed out、stream truncated 等网络故障才计为异常，状态 1 不算故障。
-- Transmission 读取 `tracker_stats`，以 `last_announce_succeeded` / `last_announce_result` 等判断是否成功或网络故障。
-- 同一 Tracker 发现网络异常时，最多从运行中的任务抽取 2 个样本，优先 qBittorrent、Transmission 各 1 个。只对样本重新汇报；下次检查确认产生新汇报且仍异常，才考虑切换 IP。
-- 在两个容器内用 `curl --resolve` 进行无代理 IPv4 TLS 探测，选取两个容器都可完成 TLS 握手且合计握手时间较短的候选 IP。HTTP 403/404 仍可能通过 TLS，**不能证明实际 announce 成功**；只用于筛选候选，实际需观察下次 Tracker 汇报。
-- 只维护目标域名 `tracker.m-team.cc`。检测到 Docker `extra_hosts`、`--add-host` 或第三方未管理的同域名记录时拒绝覆盖。修改之前预检查两个容器；第二个失败时尝试回滚。
-- `/etc/hosts` 运行时写入**不会跨容器重建持久化**。已选 IP 存在本地 `state.json`，每次 `--apply` 会先同步恢复至两个运行中的容器，避免容器重建后长期丢失。切换不重启容器，也不关闭 IPv6 Peer。
-- 监测不会强制 Tracker announce，更不会删除、停止或移动种子。若候选 IP 被 Cloudflare WAF 拒绝，即使 TLS 通过也可能无法汇报，需人工验证。
-- 不再保存固定候选 IPv4：仅在抽样重新汇报确认失败后，从 `config.json` 的 `dns_sources` 实时查询 A 记录，去重并从两个容器直连验证；若无可用候选，保持原 IP 不变。DNS 查询结果并不自动等于 Tracker 可用。
-- 正式启用前不建议另开 `pt-tracker-failover` 写入模式。M-Team 官方 CF 线路参考：https://wiki.m-team.cc/zh-tw/cf-choose-better-ip
+## 公共配置
+`pt-common/tracker-ip-common.json` 放到 `/boot/config/plugins/user.scripts/pt-common/tracker-ip-common.json`。它只配置**哪些 Tracker 域名同属一个站点、可共用哪组候选 DNS 来源**，不写入账号与密钥。默认的 M-Team 域名归属及 Cloudflare DNS 来源只是示例，需核对实际网站公告。**不在公共配置里的单域名站点同样会被自动监测**，但候选 IP 只从自身 A 记录获取，避免借用其他站点 IP。
 
-## 重新汇报限流
+监控本地 `config.json` 仅包含公共配置路径、API 凭据路径、Docker 容器名以及运行频率、抽样上限和冷却时间；已删除旧版 `failed_ratio`、`min_failed_trackers`、`consecutive_bad_runs`、`tracker_domain`、`categories`、`dns_sources`。
 
-每个 Tracker 每轮最多选取 `sample_torrents_per_tracker=2` 个运行中的异常种子。抽样后至少经过 `probe_settle_seconds=180` 秒再读取结果；`min_reannounce_interval_seconds=1800` 防止重复请求。Transmission 只选择不混有其他 Tracker 域名的种子。若任一抽样汇报恢复正常则不切换 IP。
+## 默认安全机制
+- `dry_run=true`；`--preview` 不发送汇报、不写 hosts；`--apply` 才会执行。不要同时让 `pt-tracker-failover` 运行写入模式。
+- 只统计运行中种子的网络故障；不把已暂停种子的旧错误当作实时故障。
+- 同一域名每次至多重新汇报 2 个；最短间隔 1800 秒，至少经过 180 秒后才核对新结果。最多每轮处理 2 个域名。
+- 不同域名独立保存检测状态和选定 IP；中断不会将一个站点的状态套到其他站点。
+- `curl --resolve` 验证 IPv4 HTTPS/TLS；HTTP 403/404 只能证明 TLS 连通，**不能证明 Tracker announce 正常**。
+- 只有两个容器均测试通过才会切换；发生写入错误会尽力回滚。Docker 容器重建会清除临时 hosts，下次脚本运行才恢复；原有 Docker Extra Hosts 配置冲突则拒绝修改。
+- 当前仅处理 HTTPS 默认 443 端口；UDP/HTTP/其他端口 Tracker 会被跳过。
+- **尚未在真实客户端完成双端重新汇报及切换联调；不要直接设置无人值守 --apply。**
 
-## 安装
-
+## 首次安装
 ```bash
 BASE=/boot/config/plugins/user.scripts/pt-tracker-ip-monitor
-URL=https://raw.githubusercontent.com/ccccwhite/scripts/main/pt/pt-tracker-ip-monitor
-mkdir -p "$BASE"
+COMMON=/boot/config/plugins/user.scripts/pt-common
+URL=https://raw.githubusercontent.com/ccccwhite/scripts/main/pt
+mkdir -p "$BASE" "$COMMON"
+curl -fL --proxy http://192.168.1.199:7890 "$URL/pt-common/tracker-ip-common.json" -o "$COMMON/tracker-ip-common.json"
 for f in pt_tracker_ip_monitor.php config.json script; do
-  if [ -e "$BASE/$f" ]; then echo "已有 $f，请先确认后更新"; continue; fi
-  curl -fL --retry 3 --proxy http://192.168.1.199:7890 "$URL/$f" -o "$BASE/$f" || exit 1
+  curl -fL --proxy http://192.168.1.199:7890 "$URL/pt-tracker-ip-monitor/$f" -o "$BASE/$f" || break
 done
-chmod 755 "$BASE/script"
 php -l "$BASE/pt_tracker_ip_monitor.php"
-bash -n "$BASE/script"
-bash "$BASE/script" --status
 bash "$BASE/script" --preview
 ```
 
-GitHub 下载命令使用树莓派代理只是为了拉取代码；Tracker 测试、客户端 API 和解析修改过程中均**明确禁用代理**。
+既有配置升级时不要覆盖凭据。旧版状态文件不兼容新多域名状态结构：请备份并人工检查旧 `state.json` 后再迁移，不要直接覆盖或者删除旧状态，避免丢失现有已应用 hosts 记录。
 
-共享凭据沿用 `/boot/config/plugins/user.scripts/pt-common/credentials.json`，不将凭据、Passkey 和运行态文件上传 GitHub。
-
-## 联调成功后开启自动检查
-
-先检查 `--preview` 的两个客户端数据、候选 IP 结果和解析冲突。**首次生产环境运行仍需人工观察一次真实 announce**，不要仅凭 HTTPS 403 开启无人值守切换。
-
-将本地 `config.json` 的 `dry_run` 设置为 `false`，然后在 Unraid User Scripts 建立新任务 `pt-tracker-ip-monitor-auto`：
-
-```bash
-#!/bin/bash
-bash /boot/config/plugins/user.scripts/pt-tracker-ip-monitor/script --apply
-```
-
-Cron: `*/15 * * * *`（每 15 分钟）。两个下载器每次都会检查；连续两次达到阈值、距上次切换超过 1 小时才会更换。也可在 Array Startup 建立单独一次性任务恢复解析，注意容器需已运行。
-
+## 命令
 ```bash
 BASE=/boot/config/plugins/user.scripts/pt-tracker-ip-monitor
 bash "$BASE/script" --status
 bash "$BASE/script" --preview
+# 本地 config.json 改 dry_run=false 并完成验证后：
 bash "$BASE/script" --apply
 ```
 
-**限制**：Docker 容器的 `/etc/hosts` 由 Docker 管理，应用或重建容器会覆盖手工条目；脚本在下一次执行时再修复，不会永久改变 Docker 配置模板。切换后客户端上报状态存在延迟；过于频繁切换会影响 PT 站请求频率。
+推荐验证通过后每 15 分钟调用一次 `--apply`，但不要在测试前创建定时任务。
