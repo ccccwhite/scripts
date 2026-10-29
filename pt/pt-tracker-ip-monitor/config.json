@@ -1,0 +1,30 @@
+{
+  "dry_run": true,
+  "credentials_file": "/boot/config/plugins/user.scripts/pt-common/credentials.json",
+  "state_file": "/boot/config/plugins/user.scripts/pt-tracker-ip-monitor/state.json",
+  "lock_file": "/boot/config/plugins/user.scripts/pt-tracker-ip-monitor/run.lock",
+  "qbittorrent_container": "qbittorrent",
+  "transmission_container": "transmission",
+  "tracker_domain": "tracker.m-team.cc",
+  "categories": [
+    "mteam",
+    "mt18"
+  ],
+  "candidate_ipv4": [
+    "104.17.24.14",
+    "104.17.25.14",
+    "104.16.123.96",
+    "104.16.124.96"
+  ],
+  "dns_sources": [
+    "www.cloudflare.com",
+    "cdnjs.cloudflare.com",
+    "tracker.m-team.cc"
+  ],
+  "max_candidates": 12,
+  "probe_timeout_seconds": 3,
+  "min_failed_trackers": 3,
+  "failed_ratio": 0.7,
+  "consecutive_bad_runs": 2,
+  "min_switch_interval_seconds": 3600
+}
