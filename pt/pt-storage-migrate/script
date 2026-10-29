@@ -10,6 +10,7 @@ RECOVERY=()
 for arg in "$@"; do
   case "$arg" in
     --once) ONCE=true ;;
+    --finalize-only) RECOVERY+=("$arg") ;;
     --config=*) CONFIG="${arg#*=}" ;;
     --interval=*) INTERVAL="${arg#*=}" ;;
     --timeout=*) TIMEOUT="${arg#*=}" ;;
