@@ -319,7 +319,7 @@ function sharedTransmission(array $index,array $paths,int $id): ?int {
     }
     return null;
 }
-function deletionPlan(array $entry,array $qitems,array $remove): array {
+function deletionPlan(array $entry,array $qitems,array $remove,bool $allowAlreadyRemoved=false): array {
     $expected=(array)($entry['qbit_hashes']??[]);$present=[];
     foreach($qitems as $q)$present[strtolower((string)($q['hash']??''))]=true;
     $phase=$entry['phase']??'';
@@ -328,7 +328,11 @@ function deletionPlan(array $entry,array $qitems,array $remove): array {
         if(isset($present[$hash])){
             if($phase==='qbit_removed'||!in_array($hash,$remove,true))throw new RuntimeException('qBittorrent task changed; manual review required');
         }elseif(!in_array($phase,['deleting_qbit','qbit_removed'],true)){
-            throw new RuntimeException('qBittorrent task disappeared before recorded deletion intent');
+            if(!$allowAlreadyRemoved)
+                throw new RuntimeException('qBittorrent task disappeared before recorded deletion intent; after verifying the destination, use --finalize-only if the task was removed manually');
+            // Caller must have verified Transmission destination, file sizes and local completion.
+            // This is metadata-only recovery. No missing task is deleted or re-created.
+            say('QBIT ALREADY REMOVED '.substr($hash,0,12).' : previously recorded task absent; verified destination, finalize-only recovery');
         }
     }
     return $remove;
@@ -623,7 +627,7 @@ try {
                         say('PENDING '.substr($hash,0,12).' : qBittorrent safety check: '.$qerror);
                         continue;
                     }
-                    $qremove=deletionPlan($state[$hash],$qitems,$qremove);
+                    $qremove=deletionPlan($state[$hash],$qitems,$qremove,$finalizeOnly);
                     if($qremove&&!($cfg['delete_qbit_after_move']??false)){
                         say('PENDING '.substr($hash,0,12).' : qBittorrent removal requires delete_qbit_after_move=true');
                         continue;
