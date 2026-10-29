@@ -5,26 +5,12 @@
   "lock_file": "/boot/config/plugins/user.scripts/pt-tracker-ip-monitor/run.lock",
   "qbittorrent_container": "qbittorrent",
   "transmission_container": "transmission",
-  "tracker_domain": "tracker.m-team.cc",
-  "categories": [
-    "mteam",
-    "mt18"
-  ],
-  "dns_sources": [
-    "tracker.m-team.cc",
-    "tracker.m-team.io",
-    "tra1.m-team.cc",
-    "tra1.m-team.io",
-    "www.cloudflare.com",
-    "cdnjs.cloudflare.com"
-  ],
   "max_candidates": 20,
   "probe_timeout_seconds": 3,
-  "min_failed_trackers": 1,
-  "failed_ratio": 0.7,
-  "consecutive_bad_runs": 2,
   "min_switch_interval_seconds": 3600,
   "sample_torrents_per_tracker": 2,
   "probe_settle_seconds": 180,
-  "min_reannounce_interval_seconds": 1800
+  "min_reannounce_interval_seconds": 1800,
+  "common_tracker_file": "/boot/config/plugins/user.scripts/pt-common/tracker-ip-common.json",
+  "max_domains_per_run": 2
 }
