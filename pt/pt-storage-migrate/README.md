@@ -28,6 +28,7 @@ Transmission 中完成下载且标记 `move:hdd` 的任务，从下载盘迁至 
 | `verify_after_move` | `false`，旧配置缺少此字段也按 `false` | 是否在内置移动完成后额外请求完整 Hash 校验 |
 | `max_pending_moves` | `1` | 限制尚未收尾的迁移数量；包含移动和校验阶段 |
 | `move_rpc_timeout` | `86400` 秒（24 小时），旧配置缺少此字段也使用此值 | 仅用于内置移动接口等待响应；普通 API 请求仍为 45 秒 |
+| `move_stall_seconds` | `900` 秒（15 分钟），可不填 | 目标文件长时间无变化时只输出停滞警告，不自动重试、清理或重启下载器 |
 | `state_file` | 配置文件同目录 `state.json` | 持久化迁移阶段；同目录 `run.lock` 保护直接 PHP 和入口脚本调用 |
 
 开关必须是 JSON 布尔值，不要写成字符串。首次验证保持 `dry_run=true`、`enable_move=false`。实际移动需设为 `dry_run=false`、`enable_move=true`，且要保留 `delete_qbit_after_move=true` 才能处理存在同 Hash qBit 任务的种子。两个开关关闭时不会自动处理待完成迁移。
@@ -57,6 +58,15 @@ bash "$BASE/script" --interval=10 --timeout=86400
 Transmission 的内置移动接口可能等待文件搬完才返回 HTTP 响应，大任务不能沿用普通 API 的 45 秒超时。移动请求默认等待最多 24 小时，期间集成监控继续显示文件变化；这不是强制等待 24 小时，操作完成返回后立即进入后续检查。入口 `--timeout` 控制每轮结束后的持续等待，正在执行的移动请求另受 `move_rpc_timeout` 限制。
 
 如果看到 `Operation timed out ... with 0 bytes received`，只表示没有及时收到接口响应，不代表 Transmission 已停止移动。保留 `state.json`，先用独立只读监控检查目标文件是否仍在增长；结果未确认前不要使用 `--retry-move`、删除状态或手动移动同一批文件。移动期间其他 Transmission API 查询也可能因服务忙而超时；待原操作结束后重新运行入口，会继续检查已有迁移而非重复发起。网络故障或超过移动等待上限仍会安全退出并保留状态。
+
+## 移动状态与中断保护（新版）
+
+- 新发起移动前，脚本记录该 Transmission 种子原来的运行状态，仅暂停当前种子（不暂停其他种子），等待确认停止后才调用 `torrent_set_location(move=true)`。最终验证并完成收尾后，自动恢复原本运行中的种子；原本停止的种子保持停止。历史待处理迁移没有记录原状态时，不会猜测或自动启动。
+- `preparing_move` 是准备暂停阶段，`move_requested` 是移动 RPC 已发出但未收到确定结果，`awaiting_completion` 是 RPC 已响应但仍需核验，`copy_observed` 仅代表看到了目标文件（**不代表完成**）。完成只能以 `COMPLETE` 为准。
+- 每次检查待完成迁移会读取目标文件占用和文件数；默认超过 15 分钟没有观察到增长时输出 `WARN MOVE STALLED`，仅报警，不自动重新移动。进度状态每分钟最多写入一次，以降低启动 U 盘写入。
+- 显式 `--retry-move=HASH` 在上次请求后 15 分钟内也会拒绝重试；此外仍要求源目录未变、目标文件均不存在，并通过原有完整性及共享文件保护。**如果移动仍在进行或目标文件已有部分内容，不要使用重试。**
+- `Ctrl+C` 中断入口可能停止等待 RPC 的客户端进程，但不代表 Transmission 停止后台移动。先运行 `php "$BASE/progress.php" --watch --interval=10` 只读监测，完成后再运行不带重试参数的 `bash "$BASE/script"` 收尾。
+- 升级时只替换 `migrate.php`；保留 NAS 本地 `config.json`、`state.json`、凭据和现有标签。新的状态字段兼容既有记录。
 
 ## 保护与恢复
 
