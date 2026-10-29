@@ -68,6 +68,21 @@ Transmission 的内置移动接口可能等待文件搬完才返回 HTTP 响应�
 - `Ctrl+C` 中断入口可能停止等待 RPC 的客户端进程，但不代表 Transmission 停止后台移动。先运行 `php "$BASE/progress.php" --watch --interval=10` 只读监测，完成后再运行不带重试参数的 `bash "$BASE/script"` 收尾。
 - 升级时只替换 `migrate.php`；保留 NAS 本地 `config.json`、`state.json`、凭据和现有标签。新的状态字段兼容既有记录。
 
+## 移动后 qBittorrent 显示 missingFiles 的安全收尾
+
+Transmission 成功将数据从 SSD 搬到 HDD 后，原路径的同 Hash qBittorrent 任务可能显示 `missingFiles`。这时旧的“必须仍为 stopped”的收尾检查会阻止完成。
+
+新版只在迁移已经进入待收尾状态、Transmission 目标路径和全部文件大小验证通过、本地任务完整，且该 qBittorrent 哈希曾在移动前通过停种/完整度/共享文件检查并记录在 `state.json` 中时，允许以 `missingFiles` 删除**任务记录**，始终使用 `deleteFiles=false`。其他非停止状态仍被阻止。绝不直接清理源文件或重新移动。
+
+只完成当前 pending 的安全收尾，不修改其他种子标签或启动下一项迁移：
+
+```bash
+BASE=/boot/config/plugins/user.scripts/pt-storage-migrate
+bash "$BASE/script" --once --finalize-only
+```
+
+不会为无 pending 的新种子发起移动。替换新版 `migrate.php` 和入口 `script` 即可；保留 NAS 的 `config.json`、`state.json` 和凭据。
+
 ## 保护与恢复
 
 - 移动前重新读取两个下载器。qBit 同 Hash 任务必须停止且完整，其他共享文件任务会阻止迁移；Transmission 共享文件用路径索引检查。
