@@ -320,15 +320,90 @@ function deletionPlan(array $entry,array $qitems,array $remove): array {
     return $remove;
 }
 function sendMove(array $tr,array $t,string $hash,array &$state,string $statePath,string &$session,int $timeout=86400): void {
-    $state[$hash]['phase']='move_requested';unset($state[$hash]['last_error']);
-    saveState($statePath,$state); // Write intent before RPC: a timeout must never trigger an automatic duplicate move.
+    // Persist the intent before stopping this one torrent or submitting a move RPC.
+    // An interrupted RPC can leave Transmission copying in the background.
+    $status=(int)($t['status']??-1);
+    if(!array_key_exists('resume_after_move',$state[$hash]))
+        $state[$hash]['resume_after_move']=in_array($status,[3,4,5,6],true);
+    $state[$hash]['phase']='preparing_move';
+    $state[$hash]['move_attempted_at']=date(DATE_ATOM);
+    unset($state[$hash]['last_error'],$state[$hash]['move_observation'],$state[$hash]['stall_reported_at']);
+    saveState($statePath,$state);
     try {
-        // Transmission may hold this response until the native filesystem move completes.
-        // The separate allocation observer remains live while this call waits.
+        if($status!==0){
+            // Only the selected Transmission task is paused; other seeders remain active.
+            $state[$hash]['auto_paused']=true;saveState($statePath,$state);
+            say('PAUSE '.substr($hash,0,12).' : stopping selected Transmission torrent before move');
+            rpc($tr,'torrent_stop',['ids'=>[(int)$t['id']]],$session);
+            $stopped=false;
+            for($i=0;$i<20;$i++){
+                $current=rpc($tr,'torrent_get',['ids'=>[(int)$t['id']],'fields'=>['id','hash_string','status']],$session)['torrents']??[];
+                if(count($current)!==1||strtolower((string)($current[0]['hash_string']??''))!==$hash)
+                    throw new RuntimeException('Torrent changed while waiting for stop');
+                if((int)$current[0]['status']===0){$stopped=true;break;}
+                usleep(500000);
+            }
+            if(!$stopped)throw new RuntimeException('Selected torrent did not stop; move not submitted');
+        }
+        $state[$hash]['phase']='move_requested';
+        saveState($statePath,$state);
+        $started=microtime(true);
+        // The RPC response alone does NOT prove destination files have moved.
         rpc($tr,'torrent_set_location',['ids'=>[(int)$t['id']],'location'=>$state[$hash]['destination'],'move'=>true],$session,$timeout);
-        $state[$hash]['phase']='moving';saveState($statePath,$state);
+        $state[$hash]['rpc_returned_at']=date(DATE_ATOM);
+        $state[$hash]['rpc_duration_seconds']=round(microtime(true)-$started,2);
+        $state[$hash]['phase']='awaiting_completion';
+        saveState($statePath,$state);
+        say('MOVE RPC RETURNED '.substr($hash,0,12).' after '.$state[$hash]['rpc_duration_seconds'].'s; destination verification still required');
     }catch(Throwable $e){
-        $state[$hash]['last_error']=$e->getMessage();saveState($statePath,$state);throw $e;
+        $state[$hash]['last_error']=$e->getMessage();
+        saveState($statePath,$state);
+        throw $e;
+    }
+}
+
+function moveSnapshot(array $entry,array $cfg): array {
+    $root=destinationRoot($entry,$cfg);
+    $allocated=0;$visible=0;$found=0;
+    foreach(manifest(['files'=>$entry['files']??[]]) as $name=>$length){
+        $path=safeHostPath($root,$name);
+        clearstatcache(true,$path);
+        if(!is_file($path))continue;
+        $st=stat($path);
+        if($st===false)continue;
+        $found++;
+        $visible+=min($length,max(0,(int)$st['size']));
+        $allocated+=min($length,max(0,(int)$st['blocks']*512));
+    }
+    return ['allocated'=>$allocated,'visible'=>$visible,'files'=>$found];
+}
+function observePendingMove(array &$state,string $hash,array $cfg,string $statePath): void {
+    $phase=(string)($state[$hash]['phase']??'');
+    if(!in_array($phase,['prepared','preparing_move','move_requested','moving','awaiting_completion','copy_observed'],true))return;
+    try {$current=moveSnapshot($state[$hash],$cfg);}
+    catch(Throwable $e){say('WARN MOVE OBSERVER '.substr($hash,0,12).' : '.$e->getMessage());return;}
+    $now=time();$previous=$state[$hash]['move_observation']??null;
+    $growing=!is_array($previous);
+    foreach(['allocated','visible','files'] as $key)
+        if(is_array($previous)&&$current[$key]>(int)($previous[$key]??0))$growing=true;
+    $observed=$current['files']>0 && in_array($phase,['move_requested','moving','awaiting_completion'],true);
+    if($observed){
+        $state[$hash]['phase']='copy_observed';
+        say('MOVE OBSERVED '.substr($hash,0,12).' : '.$current['files'].' destination files detected');
+    }
+    // State lives on the boot flash drive: checkpoint at most once a minute.
+    if(($growing&&(!is_array($previous)||$now-(int)($previous['at']??0)>=60))||$observed){
+        $state[$hash]['move_observation']=array_merge($current,['at'=>$now]);
+        unset($state[$hash]['stall_reported_at']);
+        saveState($statePath,$state);
+    }elseif(is_array($previous)
+        &&$now-(int)($previous['at']??$now)>=($cfg['move_stall_seconds']??900)
+        &&$now-(int)($state[$hash]['stall_reported_at']??0)>=300){
+        // Diagnostic only: neither retry nor delete data automatically.
+        $state[$hash]['stall_reported_at']=$now;
+        saveState($statePath,$state);
+        say('WARN MOVE STALLED '.substr($hash,0,12).' : no observed destination growth for '
+            .($now-(int)$previous['at']).'s; inspect Transmission and both paths; DO NOT retry while a copy may still run');
     }
 }
 function reservedBytes(array $state,string $except=''): int {
@@ -355,6 +430,9 @@ try {
     $moveTimeout=$cfg['move_rpc_timeout']??86400;
     if(!is_int($moveTimeout)||$moveTimeout<1||$moveTimeout>604800)
         throw new RuntimeException('move_rpc_timeout must be an integer from 1 to 604800 seconds');
+    $stallSeconds=$cfg['move_stall_seconds']??900;
+    if(!is_int($stallSeconds)||$stallSeconds<300||$stallSeconds>86400)
+        throw new RuntimeException('move_stall_seconds must be an integer from 300 to 86400 seconds');
     $retryHash='';$recheckHash='';$acceptHash='';
     foreach(array_slice($argv,2) as $arg){
         if(!preg_match('/^--(retry-move|recheck|accept-verified)=([a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/',$arg,$match))
@@ -438,6 +516,9 @@ try {
                 if($retryHash===$hash){
                     if(!empty($state[$hash]['verify_requested'])||norm($t['download_dir'])!==norm($state[$hash]['source']))
                         throw new RuntimeException('Retry requires original source path and no verification request');
+                    $lastAttempt=strtotime((string)($state[$hash]['move_attempted_at']??''));
+                    if($lastAttempt!==false&&time()-$lastAttempt<900)
+                        throw new RuntimeException('Retry blocked for 15 minutes after the last move request; the original move may still be running');
                     $qitems=qreq($qb,'torrents/info?filter=all',$cookie,$headers);
                     $fresh=transmissionItems($tr,$session);$t=findTorrent($fresh,$hash);$id=(int)$t['id'];
                     if(norm($t['download_dir'])!==norm($state[$hash]['source'])||!completionReady($t,false))
@@ -556,9 +637,17 @@ try {
                     say(($dry?'PREVIEW COMPLETE':'COMPLETE').' '.substr($hash,0,12).' : '.$message.($fullRecheck?'; full hash recheck confirmed':'; native move confirmed, no extra hash recheck'));
                     if(!$dry&&$moveEnabled){
                         if(!sameSet($old,$fixed))rpc($tr,'torrent_set',['ids'=>[$id],'labels'=>$fixed],$session);
+                        if(!empty($state[$hash]['resume_after_move'])&&!empty($state[$hash]['auto_paused'])){
+                            $latest=findTorrent(transmissionItems($tr,$session),$hash);
+                            if((int)($latest['status']??-1)===0){
+                                say('RESUME '.substr($hash,0,12).' : restore previously active Transmission task');
+                                rpc($tr,'torrent_start',['ids'=>[(int)$latest['id']]],$session);
+                            }
+                        }
                         unset($state[$hash]);saveState($statePath,$state);
                     }
                 }else{
+                    observePendingMove($state,$hash,$cfg,$statePath);
                     $err=(int)($t['error']??0);
                     say('PENDING '.substr($hash,0,12).' : '.$message.'; status='.(string)($t['status']??'?').'; error='.$err);
                     say('RECOVERY: inspect source/destination; --retry-move=HASH only accepts original source and no existing destination files');
@@ -622,7 +711,9 @@ try {
                 $manifest[]=['name'=>$fileName,'length'=>$fileLength];$totalBytes+=$fileLength;
             }
             $entry=['phase'=>'prepared','destination'=>$dest,'source'=>$dir,'hdd_path'=>$hdd,'hdd_host_path'=>$cfg['hdd_host_path'],
-                'requested_at'=>date(DATE_ATOM),'verify_requested'=>false,'seen_verifying'=>false,'qbit_hashes'=>$qremove,'files'=>$manifest,'total_bytes'=>$totalBytes];
+                'requested_at'=>date(DATE_ATOM),'verify_requested'=>false,'seen_verifying'=>false,
+                'original_status'=>(int)$current['status'],'resume_after_move'=>in_array((int)$current['status'],[3,4,5,6],true),
+                'qbit_hashes'=>$qremove,'files'=>$manifest,'total_bytes'=>$totalBytes];
             $moveCfg=$cfg;$moveCfg['_reserved_bytes']=reservedBytes($state);
             preflightDestination($current,$entry,$moveCfg);
             $state[$hash]=$entry;saveState($statePath,$state);
