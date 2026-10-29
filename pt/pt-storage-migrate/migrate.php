@@ -338,33 +338,15 @@ function deletionPlan(array $entry,array $qitems,array $remove,bool $allowAlread
     return $remove;
 }
 function sendMove(array $tr,array $t,string $hash,array &$state,string $statePath,string &$session,int $timeout=86400): void {
-    // Persist the intent before stopping this one torrent or submitting a move RPC.
-    // An interrupted RPC can leave Transmission copying in the background.
-    $status=(int)($t['status']??-1);
-    if(!array_key_exists('resume_after_move',$state[$hash]))
-        $state[$hash]['resume_after_move']=in_array($status,[3,4,5,6],true);
-    $state[$hash]['phase']='preparing_move';
+    // Leave Transmission's running/stopped state untouched: native set-location
+    // manages its own file handles. Never stop/start the torrent for a new move.
+    // Preserve legacy auto_paused state for unfinished migrations created by older versions.
+    $state[$hash]['phase']='move_requested';
     $state[$hash]['move_attempted_at']=date(DATE_ATOM);
     unset($state[$hash]['last_error'],$state[$hash]['move_observation'],$state[$hash]['stall_reported_at']);
-    saveState($statePath,$state);
+    saveState($statePath,$state); // Persist intent before RPC to prevent duplicate moves after interruption.
     try {
-        if($status!==0){
-            // Only the selected Transmission task is paused; other seeders remain active.
-            $state[$hash]['auto_paused']=true;saveState($statePath,$state);
-            say('PAUSE '.substr($hash,0,12).' : stopping selected Transmission torrent before move');
-            rpc($tr,'torrent_stop',['ids'=>[(int)$t['id']]],$session);
-            $stopped=false;
-            for($i=0;$i<20;$i++){
-                $current=rpc($tr,'torrent_get',['ids'=>[(int)$t['id']],'fields'=>['id','hash_string','status']],$session)['torrents']??[];
-                if(count($current)!==1||strtolower((string)($current[0]['hash_string']??''))!==$hash)
-                    throw new RuntimeException('Torrent changed while waiting for stop');
-                if((int)$current[0]['status']===0){$stopped=true;break;}
-                usleep(500000);
-            }
-            if(!$stopped)throw new RuntimeException('Selected torrent did not stop; move not submitted');
-        }
-        $state[$hash]['phase']='move_requested';
-        saveState($statePath,$state);
+        say('MOVE REQUEST '.substr($hash,0,12).' : Transmission status unchanged ('.(int)($t['status']??-1).'); native move=true');
         $started=microtime(true);
         // The RPC response alone does NOT prove destination files have moved.
         rpc($tr,'torrent_set_location',['ids'=>[(int)$t['id']],'location'=>$state[$hash]['destination'],'move'=>true],$session,$timeout);
@@ -656,6 +638,8 @@ try {
                     say(($dry?'PREVIEW COMPLETE':'COMPLETE').' '.substr($hash,0,12).' : '.$message.($fullRecheck?'; full hash recheck confirmed':'; native move confirmed, no extra hash recheck'));
                     if(!$dry&&$moveEnabled){
                         if(!sameSet($old,$fixed))rpc($tr,'torrent_set',['ids'=>[$id],'labels'=>$fixed],$session);
+                        // Resume only legacy migrations that the old script explicitly paused.
+                        // New migrations never set auto_paused and are not started/stopped here.
                         if(!empty($state[$hash]['resume_after_move'])&&!empty($state[$hash]['auto_paused'])){
                             $latest=findTorrent(transmissionItems($tr,$session),$hash);
                             if((int)($latest['status']??-1)===0){
