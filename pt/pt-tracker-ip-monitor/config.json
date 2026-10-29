@@ -12,5 +12,7 @@
   "probe_settle_seconds": 180,
   "min_reannounce_interval_seconds": 1800,
   "common_tracker_file": "/boot/config/plugins/user.scripts/pt-common/tracker-ip-common.json",
-  "max_domains_per_run": 2
+  "max_domains_per_run": 2,
+  "post_switch_max_per_run": 120,
+  "post_switch_delay_seconds": 5
 }
