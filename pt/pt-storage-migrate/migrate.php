@@ -277,7 +277,17 @@ function preflightDestination(array $t,array $entry,array $cfg): void {
     }
     clearstatcache();$free=disk_free_space($cfg['hdd_host_path']);
     if($free===false||$free<$bytes+($cfg['_reserved_bytes']??0)+max(1073741824,(int)ceil($bytes*0.05)))throw new RuntimeException('Insufficient HDD free space');
-    if(!is_dir($root)&&!mkdir($root,0775,true)&&!is_dir($root))throw new RuntimeException('Cannot create site directory');
+    // Set ownership for site directories created by the root-run migration script.
+    $created=false;
+    if(!is_dir($root)){
+        if(!mkdir($root,0775,true)&&!is_dir($root))
+            throw new RuntimeException('Cannot create site directory');
+        $created=true;
+    }
+    if($created){
+        if(!chown($root,99)||!chgrp($root,100)||!chmod($root,0775))
+            throw new RuntimeException('Cannot set Transmission directory ownership');
+    }
     destinationRoot($entry,$cfg);
 }
 function transmissionItems(array $tr,string &$session): array {
@@ -522,7 +532,37 @@ try {
                         throw new RuntimeException('Retry blocked for 15 minutes after the last move request; the original move may still be running');
                     $qitems=qreq($qb,'torrents/info?filter=all',$cookie,$headers);
                     $fresh=transmissionItems($tr,$session);$t=findTorrent($fresh,$hash);$id=(int)$t['id'];
-                    if(norm($t['download_dir'])!==norm($state[$hash]['source'])||!completionReady($t,false))
+                    // Allow a guarded retry after a recorded native move permission error.
+                    $historicalMoveError=false;
+                    if((int)($t['error']??0)===3){
+                        $detail=(string)($t['error_string']??'');
+                        $recorded=(string)($state[$hash]['last_error']??'');
+                        $historicalMoveError=
+                            (int)($t['status']??-1)===0
+                            && $recorded!=='' && $recorded===$detail
+                            && str_contains($detail,"Couldn't move")
+                            && str_contains($detail,'Permission denied (13)')
+                            && (int)($t['size_when_done']??0)>0
+                            && (int)($t['have_valid']??-1)===(int)$t['size_when_done']
+                            && (int)($t['have_unchecked']??-1)===0
+                            && (int)($t['left_until_done']??-1)===0
+                            && (float)($t['percent_done']??0)>=0.999999;
+                        if(!$historicalMoveError)
+                            throw new RuntimeException('Historical move error is not eligible for safe retry');
+                        $source=norm((string)$state[$hash]['source']);
+                        if(!within($source,'/temp')||$source==='/temp')
+                            throw new RuntimeException('Retry source outside SSD tree');
+                        $hostSource='/mnt/download'.substr($source,strlen('/temp'));
+                        foreach(manifest($t) as $fileName=>$fileLength){
+                            $sourceFile=safeHostPath($hostSource,$fileName);
+                            clearstatcache(true,$sourceFile);
+                            if(!is_file($sourceFile)||filesize($sourceFile)!==$fileLength)
+                                throw new RuntimeException('Retry source missing or size mismatch: '.$fileName);
+                        }
+                        say('RETRY PREFLIGHT '.substr($hash,0,12).' : historical move error; source sizes OK');
+                    }
+                    if(norm($t['download_dir'])!==norm($state[$hash]['source'])
+                       ||(!completionReady($t,false)&&!$historicalMoveError))
                         throw new RuntimeException('Retry source path/completeness changed');
                     $paths=torrentPaths($t);
                     $shared=sharedTransmission(transmissionIndex($fresh),$paths,$id);
@@ -652,6 +692,16 @@ try {
                 }else{
                     observePendingMove($state,$hash,$cfg,$statePath);
                     $err=(int)($t['error']??0);
+                    if($err===3){
+                        $detail=trim((string)($t['error_string']??''));
+                        $detail=$detail!==''?$detail:'Transmission local file error (3)';
+                        if(($state[$hash]['last_error']??null)!==$detail){
+                            $state[$hash]['last_error']=$detail;
+                            $state[$hash]['move_error_at']=date(DATE_ATOM);
+                            saveState($statePath,$state);
+                        }
+                        say('MOVE ERROR '.substr($hash,0,12).' : '.$detail);
+                    }
                     say('PENDING '.substr($hash,0,12).' : '.$message.'; status='.(string)($t['status']??'?').'; error='.$err);
                     say('RECOVERY: inspect source/destination; --retry-move=HASH only accepts original source and no existing destination files');
                     // Do not trigger verification on tracker errors or incomplete moves.
