@@ -61,8 +61,8 @@ Transmission 的内置移动接口可能等待文件搬完才返回 HTTP 响应�
 
 ## 移动状态与中断保护（新版）
 
-- 新发起移动前，脚本记录该 Transmission 种子原来的运行状态，仅暂停当前种子（不暂停其他种子），等待确认停止后才调用 `torrent_set_location(move=true)`。最终验证并完成收尾后，自动恢复原本运行中的种子；原本停止的种子保持停止。历史待处理迁移没有记录原状态时，不会猜测或自动启动。
-- `preparing_move` 是准备暂停阶段，`move_requested` 是移动 RPC 已发出但未收到确定结果，`awaiting_completion` 是 RPC 已响应但仍需核验，`copy_observed` 仅代表看到了目标文件（**不代表完成**）。完成只能以 `COMPLETE` 为准。
+- 新发起移动时，脚本**不会主动停止或启动 Transmission 种子**，直接调用原生 `torrent_set_location(move=true)`，由 Transmission 自行管理文件句柄。原本正在做种的任务保持其运行状态，但磁盘迁移期间上传可能短暂受到影响；原本停止的任务保持停止。对于历史版本已设置 `auto_paused` 的待处理迁移，仍在完成验证后按其记录恢复，兼容旧状态。
+- `preparing_move` 仅可能出现在旧版遗留状态中，`move_requested` 是移动 RPC 已发出但未收到确定结果，`awaiting_completion` 是 RPC 已响应但仍需核验，`copy_observed` 仅代表看到了目标文件（**不代表完成**）。完成只能以 `COMPLETE` 为准。
 - 每次检查待完成迁移会读取目标文件占用和文件数；默认超过 15 分钟没有观察到增长时输出 `WARN MOVE STALLED`，仅报警，不自动重新移动。进度状态每分钟最多写入一次，以降低启动 U 盘写入。
 - 显式 `--retry-move=HASH` 在上次请求后 15 分钟内也会拒绝重试；此外仍要求源目录未变、目标文件均不存在，并通过原有完整性及共享文件保护。**如果移动仍在进行或目标文件已有部分内容，不要使用重试。**
 - `Ctrl+C` 中断入口可能停止等待 RPC 的客户端进程，但不代表 Transmission 停止后台移动。先运行 `php "$BASE/progress.php" --watch --interval=10` 只读监测，完成后再运行不带重试参数的 `bash "$BASE/script"` 收尾。
