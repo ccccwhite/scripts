@@ -300,13 +300,20 @@ function probeIP(string $container,string $host,string $ip,int $timeout): array 
     return [(float)$m[2]>0.0,(float)$m[2]];
 }
 function candidates(array $cfg): array {
+    // DNS is fetched again ONLY after fresh sampled announce failures.
+    // Never use hardcoded candidate IPs or cached historical DNS responses.
+    $sources=$cfg['dns_sources']??[];
+    if(!is_array($sources)||count($sources)===0)
+        throw new RuntimeException('dns_sources must contain DNS names');
     $all=[];
-    foreach($cfg['candidate_ipv4']??[] as $ip)$all[]=$ip;
-    foreach($cfg['dns_sources']??[] as $name){
+    foreach($sources as $name){
         if(!is_string($name)||!preg_match('/^[a-zA-Z0-9.-]+$/D',$name))continue;
-        foreach(@dns_get_record($name,DNS_A)?:[] as $row)$all[]=$row['ip']??'';
+        $rows=@dns_get_record($name,DNS_A) ?: [];
+        say('Fresh DNS '.$name.' returned '.count($rows).' A records');
+        foreach($rows as $row)$all[]=$row['ip']??'';
     }
-    $max=max(1,min(24,(int)($cfg['max_candidates']??12)));$out=[];
+    $max=max(1,min(64,(int)($cfg['max_candidates']??20)));
+    $out=[];
     foreach(array_unique($all) as $ip){
         if(!is_string($ip)||!filter_var($ip,FILTER_VALIDATE_IP,
             FILTER_FLAG_IPV4|FILTER_FLAG_NO_PRIV_RANGE|FILTER_FLAG_NO_RES_RANGE))continue;
