@@ -1,0 +1,24 @@
+{
+  "dry_run": true,
+  "credentials_file": "/boot/config/plugins/user.scripts/pt-common/credentials.json",
+  "pending_file": "/boot/config/plugins/user.scripts/pt-tracker-failover/pending_sync.json",
+  "lock_file": "/boot/config/plugins/user.scripts/pt-tracker-failover/run.lock",
+  "probe_timeout_seconds": 4,
+  "max_changes_per_run": 5,
+  "delay_seconds": 3,
+  "sites": {
+    "mteam": {
+      "categories": [
+        "mteam",
+        "mt18"
+      ],
+      "trackers": [
+        "https://tracker.m-team.cc",
+        "https://tra99.manfuz.co",
+        "https://tra1.m-team.io",
+        "https://tra1.m-team.cc",
+        "https://tracker.m-team.io"
+      ]
+    }
+  }
+}
