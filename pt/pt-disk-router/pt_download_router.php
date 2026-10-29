@@ -291,7 +291,12 @@ function processOne(string $hash, array $t, array $cfg, array &$state, array $li
     $epoch = (int)($cfg['activation_epoch'] ?? 0);
     if ($epoch < 1 || (int)($t['added_on'] ?? 0) < $epoch)
         fail('Not a new task created after activation_epoch');
-    if (!hasNoContent($t)) fail('Torrent must be STOPPED with zero progress and zero downloaded bytes');
+    if (!hasNoContent($t)) {
+        // A user may manually start a torrent before the event watcher routes it.
+        // Never move live or partially downloaded data through the new-torrent path:
+        // recovery is a separate explicitly requested operation.
+        return 'REPAIR_REQUIRED: torrent has started/received data; run repair_existing.php after review';
+    }
     $size = max((int)($t['size'] ?? 0), (int)($t['total_size'] ?? 0));
     if ($size <= 0) return 'waiting for torrent metadata/size';
     $root = $disk === 'ssd' ? (string)$cfg['ssd_root'] : (string)$cfg['disk_roots'][$disk];
