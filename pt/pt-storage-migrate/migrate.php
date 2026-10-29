@@ -79,7 +79,7 @@ function qbitPath(array $q): array {
     $content=norm((string)($q['content_path']??'/'));
     return ['path'=>$content!=='/'?$content:$save,'save'=>$save];
 }
-function qbitMoveGuards(array $qitems,array $files,string $hash): array {
+function qbitMoveGuards(array $qitems,array $files,string $hash,?array $verifiedMove=null): array {
     $toRemove=[];
     foreach($qitems as $q){
         $qh=strtolower((string)($q['hash']??''));
@@ -90,8 +90,22 @@ function qbitMoveGuards(array $qitems,array $files,string $hash): array {
         }
         if(!$overlap)continue;
         if($qh!==$hash)return [null,'shared with other qBittorrent task '.substr($qh,0,12)];
-        if(!qbitStopped($q))return [null,'matching qBittorrent task is not paused/stopped ('.($q['state']??'?').')'];
-        if(!qbitComplete($q))return [null,'matching qBittorrent task is incomplete'];
+        // Only after verifyDestination() AND completionReady() succeeded, a previously
+        // validated, stopped, complete qBit torrent may turn into missingFiles because
+        // Transmission moved its data. Never relax the pre-move check or other states.
+        $source=$verifiedMove===null?'':(string)($verifiedMove['source']??'');
+        $relocatedMissing=$verifiedMove!==null
+            && $source!=='' && $source!=='/'
+            && (string)($q['state']??'')==='missingFiles'
+            && in_array($qh,(array)($verifiedMove['qbit_hashes']??[]),true)
+            && (within($p['path'],$source)||within($p['save'],$source));
+        if(!qbitStopped($q)&&!$relocatedMissing)
+            return [null,'matching qBittorrent task is not paused/stopped ('.($q['state']??'?').')'];
+        // The completed source was validated before move. A relocated missingFiles
+        // task may no longer report progress=1; the HDD data is checked independently.
+        if(!qbitComplete($q)&&!$relocatedMissing)
+            return [null,'matching qBittorrent task is incomplete'];
+        if($relocatedMissing)say('QBIT RELOCATED '.substr($qh,0,12).' : missingFiles after verified move; metadata-only removal permitted');
         $toRemove[$qh]=true;
     }
     return [array_keys($toRemove),null];
@@ -433,8 +447,9 @@ try {
     $stallSeconds=$cfg['move_stall_seconds']??900;
     if(!is_int($stallSeconds)||$stallSeconds<300||$stallSeconds>86400)
         throw new RuntimeException('move_stall_seconds must be an integer from 300 to 86400 seconds');
-    $retryHash='';$recheckHash='';$acceptHash='';
+    $retryHash='';$recheckHash='';$acceptHash='';$finalizeOnly=false;
     foreach(array_slice($argv,2) as $arg){
+        if($arg==='--finalize-only'){$finalizeOnly=true;continue;}
         if(!preg_match('/^--(retry-move|recheck|accept-verified)=([a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/',$arg,$match))
             throw new RuntimeException('Unknown option: '.$arg);
         $target=strtolower($match[2]);
@@ -483,7 +498,7 @@ try {
             say('PENDING '.$pendingHash.' : Transmission task missing; keep state for manual review');
         say('qBittorrent '.count($qitems).', Transmission '.count($titems).', mode '.($dry?'DRY RUN':'WRITE').', move '.($moveEnabled?'enabled':'disabled'));
         $qchanges=0;$tchanges=0;$candidates=0;
-        foreach($qitems as $q) {
+        foreach(($finalizeOnly?[]:$qitems) as $q) {
             $hash=strtolower((string)($q['hash']??''));$save=norm((string)($q['save_path']??'/'));
             $content=norm((string)($q['content_path']??'/'));
             $loc=location($save,$ssd,$hdd,$download);
@@ -603,7 +618,7 @@ try {
                         $sourceFiles[]=norm($state[$hash]['source'].'/'.$fn);
                     }
                     $qitems=qreq($qb,'torrents/info?filter=all',$cookie,$headers);
-                    [$qremove,$qerror]=qbitMoveGuards($qitems,array_merge($sourceFiles,torrentPaths($t)),$hash);
+                    [$qremove,$qerror]=qbitMoveGuards($qitems,array_merge($sourceFiles,torrentPaths($t)),$hash,$state[$hash]);
                     if($qerror!==null){
                         say('PENDING '.substr($hash,0,12).' : qBittorrent safety check: '.$qerror);
                         continue;
@@ -656,6 +671,7 @@ try {
                 }
                 continue;
             }
+            if($finalizeOnly)continue; // Do not create new migrations or modify unrelated tasks.
             $new=changeLabels($old,$loc,$cfg);
             if($loc===null)say('WARN Transmission '.substr($hash,0,12).' outside storage; skip labels');
             elseif(!sameSet($old,$new)){
