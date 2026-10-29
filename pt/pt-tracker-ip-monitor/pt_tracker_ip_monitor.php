@@ -213,6 +213,52 @@ function selectSamples(array $q,array $t,int $limit): array {
     }
     return $out;
 }
+function postSwitchQueue(array $q,array $t): array {
+    $jobs=[];$seen=[];
+    foreach([$q['samples']??[],$t['samples']??[]] as $rows)
+      foreach($rows as $s){
+        $id=$s['client'].':'.$s['hash'];
+        if(isset($seen[$id]))continue;
+        $seen[$id]=1;
+        $jobs[]=['client'=>$s['client'],'hash'=>$s['hash']];
+      }
+    return $jobs;
+}
+function drainPostSwitch(string $host,array $q,array $t,array &$entry,array &$state,
+                         string $statePath,Qbit $qb,Transmission $tr,array $cfg,bool $apply): bool {
+    $jobs=(array)($entry['post_jobs']??[]);
+    $total=count($jobs);$index=(int)($entry['post_index']??0);
+    if($index >= $total)return true;
+    say('POST_SWITCH '.$host.' completed='.$index.'/'.$total);
+    if(!$apply)return false;
+    $active=[];
+    foreach([$q['samples']??[],$t['samples']??[]] as $rows)
+      foreach($rows as $s)$active[$s['client'].':'.$s['hash']]=$s;
+    $limit=max(1,min(300,(int)($cfg['post_switch_max_per_run']??120)));
+    $delay=max(0,min(30,(int)($cfg['post_switch_delay_seconds']??5)));
+    for($n=0;$index<$total && $n<$limit;$n++){
+        $job=$jobs[$index];
+        $index++;
+        $entry['post_index']=$index;
+        $state[$host]=$entry;stateSave($statePath,$state);
+        $id=$job['client'].':'.$job['hash'];
+        if(!isset($active[$id])){
+           say('POST_SKIP '.$host.' '.$job['client'].' '.substr($job['hash'],0,10));
+           continue;
+        }
+        try {
+          if($job['client']==='qbit')
+             $qb->reannounce($job['hash'],$active[$id]['url']);
+          else
+             $tr->reannounce($job['hash']);
+          say('POST_ANNOUNCE '.$host.' '.$job['client'].' '.substr($job['hash'],0,10));
+        }catch(Throwable $e){
+          say('POST_ERROR '.$host.' '.$job['client'].' '.substr($job['hash'],0,10).' '.$e->getMessage());
+        }
+        if($delay && $index<$total) sleep($delay);
+    }
+    return $index >= $total;
+}
 function verifySamples(array $samples,Qbit $qb,Transmission $tr,string $host,int $settle): array {
     $ok=0;$bad=0;$pending=0;
     $map=[];
@@ -410,6 +456,21 @@ try{
         say($host.' qBit(ok='.$qv['ok'].' bad='.$qv['bad'].') trans(ok='.$tv['ok'].' bad='.$tv['bad'].')');
         if(($entry['current_ip']??'')!==''){
             syncHosts($containers,$host,(string)$entry['current_ip'],$apply);
+            if(!isset($entry['post_ip']) && (int)($entry['last_switch']??0)>0){
+                say('POST_SWITCH existing IP has no bulk state: '.$host);
+                if($apply){
+                    $entry['post_ip']=$entry['current_ip'];
+                    $entry['post_jobs']=postSwitchQueue($qv,$tv);
+                    $entry['post_index']=0;
+                    $state[$host]=$entry;stateSave($statePath,$state);
+                }
+            }
+            if(($entry['post_ip']??'')===$entry['current_ip']
+               && (int)($entry['post_index']??0)<count((array)($entry['post_jobs']??[]))){
+                drainPostSwitch($host,$qv,$tv,$entry,$state,$statePath,$qb,$tr,$cfg,$apply);
+                $processed++;
+                continue;
+            }
         }
         if($bad===0){
             if($apply&&($entry['samples']??[])){ $entry['samples']=[];$state[$host]=$entry;stateSave($statePath,$state); }
@@ -463,7 +524,11 @@ try{
         syncHosts($containers,$host,$best,$apply);
         if($apply){
             $entry['current_ip']=$best;$entry['last_switch']=time();$entry['samples']=[];
+            $entry['post_ip']=$best;
+            $entry['post_jobs']=postSwitchQueue($qv,$tv);
+            $entry['post_index']=0;
             $state[$host]=$entry;stateSave($statePath,$state);
+            drainPostSwitch($host,$qv,$tv,$entry,$state,$statePath,$qb,$tr,$cfg,true);
         }
         $processed++;
     }
