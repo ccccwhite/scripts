@@ -3,17 +3,21 @@
 适配 Unraid 6.12.13、qBittorrent 5.3.0、Transmission 4.1.3。**两个客户端同时定期检查** `tracker.m-team.cc`，连续判定网络异常时测试 Cloudflare 候选 IPv4，然后同步更新**两个 Docker 容器的运行时 `/etc/hosts`**，保留全部 Torrent Tracker URL、Passkey、路径、标签。与已有更换 Tracker URL 的 `pt-tracker-failover` 不同，两个方案不要同时启用 `--apply`。
 
 ## 默认安全条件
-- `dry_run: true`；只能 `--preview`，先测试再启用 `--apply`。
+- `dry_run: true`；`--preview` 只读，不触发重新汇报。启用 `--apply` 后才对样本发起重新汇报。
 - 必须成功读取 **qBittorrent 与 Transmission** 的 API，任何一端不可用即中止。
 - qBit 检查目标域名各条种子的 Tracker 状态；状态 4 且消息属于 timed out、stream truncated 等网络故障才计为异常，状态 1 不算故障。
 - Transmission 读取 `tracker_stats`，以 `last_announce_succeeded` / `last_announce_result` 等判断是否成功或网络故障。
-- 一个客户端至少 3 条明确网络错误且在明确成功/失败的汇报中占比 ≥70%，**连续 2 次检查**才能切换。切换最短间隔 3600 秒。默认每 15 分钟运行，意味着至少两次自动检查。
+- 同一 Tracker 发现网络异常时，最多从运行中的任务抽取 2 个样本，优先 qBittorrent、Transmission 各 1 个。只对样本重新汇报；下次检查确认产生新汇报且仍异常，才考虑切换 IP。
 - 在两个容器内用 `curl --resolve` 进行无代理 IPv4 TLS 探测，选取两个容器都可完成 TLS 握手且合计握手时间较短的候选 IP。HTTP 403/404 仍可能通过 TLS，**不能证明实际 announce 成功**；只用于筛选候选，实际需观察下次 Tracker 汇报。
 - 只维护目标域名 `tracker.m-team.cc`。检测到 Docker `extra_hosts`、`--add-host` 或第三方未管理的同域名记录时拒绝覆盖。修改之前预检查两个容器；第二个失败时尝试回滚。
 - `/etc/hosts` 运行时写入**不会跨容器重建持久化**。已选 IP 存在本地 `state.json`，每次 `--apply` 会先同步恢复至两个运行中的容器，避免容器重建后长期丢失。切换不重启容器，也不关闭 IPv6 Peer。
 - 监测不会强制 Tracker announce，更不会删除、停止或移动种子。若候选 IP 被 Cloudflare WAF 拒绝，即使 TLS 通过也可能无法汇报，需人工验证。
 - 候选 IPv4 和 DNS 采集来源在 `config.json` 配置。修改的是解析目标 IP，而非 Tracker URL；只需这两个 Docker 使用，无需改 Unraid 全局网络。
 - 正式启用前不建议另开 `pt-tracker-failover` 写入模式。M-Team 官方 CF 线路参考：https://wiki.m-team.cc/zh-tw/cf-choose-better-ip
+
+## 重新汇报限流
+
+每个 Tracker 每轮最多选取 `sample_torrents_per_tracker=2` 个运行中的异常种子。抽样后至少经过 `probe_settle_seconds=180` 秒再读取结果；`min_reannounce_interval_seconds=1800` 防止重复请求。Transmission 只选择不混有其他 Tracker 域名的种子。若任一抽样汇报恢复正常则不切换 IP。
 
 ## 安装
 
