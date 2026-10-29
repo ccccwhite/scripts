@@ -8,6 +8,9 @@ BASE="/boot/config/plugins/user.scripts/pt-disk-router"
 QUEUE="/mnt/user/appdata/qbittorrent/pt-router/queue"
 LOCK="/var/run/pt-disk-router-watch.lock"
 RETRY="${PT_DISK_WATCH_RETRY:-30}"
+COOLDOWN="${PT_DISK_WATCH_COOLDOWN:-300}"
+LAST_RUN=0
+LAST_QUEUE_SIGNATURE=""
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 if ! [[ "$RETRY" =~ ^[0-9]+$ ]] || (( RETRY < 5 || RETRY > 600 )); then
@@ -48,13 +51,23 @@ run_pending() {
     [[ -d /mnt/user/qbit && -d "$QUEUE" ]] || return 0
     has_pending || return 0
     [[ "$(docker inspect -f '{{.State.Running}}' qbittorrent 2>/dev/null)" == "true" ]] || return 0
+    # Reduce repeated failure logs from already-started jobs. New queue events
+    # bypass the cooldown, but unresolved jobs are still retried periodically.
+    local signature now
+    signature="$(find "$QUEUE" -maxdepth 1 -type f -printf '%f %T@\\n' 2>/dev/null | sort | sha256sum | cut -d' ' -f1)"
+    now="$(date +%s)"
+    if [[ "$signature" == "$LAST_QUEUE_SIGNATURE" ]] && (( now - LAST_RUN < COOLDOWN )); then
+        return 0
+    fi
+    LAST_QUEUE_SIGNATURE="$signature"
+    LAST_RUN="$now"
     log "Pending torrent event(s); invoking router --apply"
     if ! /bin/bash "$BASE/script" --apply; then
         log "WARN: router returned an error; retaining queue for retry"
     fi
 }
 
-log "Watcher started; event-triggered routing, pending retry every ${RETRY}s"
+log "Watcher started; events checked every ${RETRY}s; unchanged queue retried every ${COOLDOWN}s"
 while :; do
     if [[ ! -d "$QUEUE" ]]; then
         sleep 5
