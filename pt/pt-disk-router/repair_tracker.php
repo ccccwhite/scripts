@@ -80,7 +80,7 @@ try{
         if(rtrim((string)($t['save_path']??''),'/')!==$destination)bad('Torrent not at target; move and wait first');
         if(!stopped((string)($t['state']??'')))bad('Stop torrent before enrollment');
         if((bool)($t['auto_tmm']??true))bad('Automatic management enabled');
-        if((float)($t['progress']??0)<=0)bad('No data; use original router');
+        if((float)($t['progress']??0)<1.0 || (int)($t['amount_left']??1)!==0)bad('Only 100% completed torrents are enrolled in this verified first release');
         $state['jobs'][$hash]=['phase'=>'ready_to_recheck','destination'=>$destination,'category'=>$cat,
             'resume'=>$resume,'enrolled_at'=>time(),'updated_at'=>time(),'seen_checking'=>false,
             'check_requested_at'=>null,'original_complete'=>(float)($t['progress']??0)>=1.0];
@@ -114,9 +114,7 @@ try{
             elseif(($job['seen_checking']??false)===true){
                 // Completion must follow an OBSERVED checking state.
                 // For complete torrents require 100% with zero remaining bytes.
-                if(($job['original_complete']??false)===true &&
-                    (float)($t['progress']??0)<1.0 || ($job['original_complete']??false)===true &&
-                    (int)($t['amount_left']??1)!==0){
+                if((float)($t['progress']??0)<1.0 || (int)($t['amount_left']??1)!==0){
                     $job['phase']='failed';$job['error']='Hash verification lost data';
                 }elseif(!stopped($s)){
                     $job['phase']='failed';$job['error']='Torrent resumed externally during verification';
