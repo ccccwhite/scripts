@@ -11,6 +11,7 @@ RETRY="${PT_DISK_WATCH_RETRY:-30}"
 COOLDOWN="${PT_DISK_WATCH_COOLDOWN:-300}"
 LAST_RUN=0
 LAST_QUEUE_SIGNATURE=""
+FAST_RETRY=0
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 if ! [[ "$RETRY" =~ ^[0-9]+$ ]] || (( RETRY < 5 || RETRY > 600 )); then
@@ -62,8 +63,18 @@ run_pending() {
     LAST_QUEUE_SIGNATURE="$signature"
     LAST_RUN="$now"
     log "Pending torrent event(s); invoking router --apply"
-    if ! /bin/bash "$BASE/script" --apply; then
+    local output
+    if ! output="$(/bin/bash "$BASE/script" --apply 2>&1)"; then
         log "WARN: router returned an error; retaining queue for retry"
+    fi
+    [[ -z "$output" ]] || printf '%s\n' "$output"
+    if [[ "$output" == *WAIT_TRANSIENT* ]]; then
+        # Quick retry for a newly-added zero-byte torrent whose state is
+        # still settling. Keep all safety checks in the PHP router.
+        FAST_RETRY=1
+        LAST_RUN=0
+    else
+        FAST_RETRY=0
     fi
 }
 
@@ -83,7 +94,9 @@ while :; do
 
     # Event arrives quickly when on-add.sh creates a new hash file. A timeout
     # also allows later tag edits (which have no qBit on-add event) to retry.
-    if inotifywait -q -t "$RETRY" \
+    timeout_sec="$RETRY"
+    (( FAST_RETRY == 1 )) && timeout_sec=5
+    if inotifywait -q -t "$timeout_sec" \
         -e create -e moved_to -e close_write \
         "$QUEUE" >/dev/null 2>&1; then
         # Give qBit time to finish saving the new torrent metadata and tags.
