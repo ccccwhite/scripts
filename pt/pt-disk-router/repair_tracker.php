@@ -105,8 +105,29 @@ try{
                 // silently issues another check or resumes an unverified task.
                 $job['phase']='check_requested';$job['check_requested_at']=time();
                 $job['seen_checking']=false;writeJ($file,$state);
-                try{$q->post('torrents/recheck',['hashes'=>$hash]);echo substr($hash,0,12)." CHECK REQUESTED\n";}
-                catch(Throwable $e){$job['phase']='failed';$job['error']='Recheck request failed: '.$e->getMessage();}
+                try{
+                    $q->post('torrents/recheck',['hashes'=>$hash]);
+                    echo substr($hash,0,12)." CHECK REQUESTED; sampling at 0.5s intervals\n";
+                    // Observe the asynchronous checking state inside this same
+                    // invocation, rather than relying on 30s watcher polling.
+                    // No resume from this branch: final verification remains
+                    // the job of a subsequent --poll after checking was seen.
+                    for($sample=0;$sample<40;$sample++){
+                        usleep(500000);
+                        $latest=$q->get('torrents/info?filter=all');
+                        $current=null;
+                        foreach($latest as $item)if(strtolower((string)($item['hash']??''))===$hash){$current=$item;break;}
+                        if(!$current)bad('Torrent vanished during check sampling');
+                        $currentState=(string)($current['state']??'');
+                        if(checking($currentState)){
+                            $job['phase']='checking';$job['seen_checking']=true;
+                            $job['updated_at']=time();writeJ($file,$state);
+                            echo substr($hash,0,12)." CHECKING OBSERVED\n";
+                            break;
+                        }
+                        if(!stopped($currentState))bad('Unexpected state during check sampling: '.$currentState);
+                    }
+                }catch(Throwable $e){$job['phase']='failed';$job['error']='Recheck start/sampling failed: '.$e->getMessage();}
             }
         } elseif($phase==='check_requested'||$phase==='checking'){
             $s=(string)($t['state']??'');
