@@ -66,3 +66,13 @@ has reached `verified`.
 Because the tracker requires the torrent to be stopped at enrollment, a torrent
 that was already resumed after a move must be stopped again if you want to
 enroll it. The tracker does not infer that an earlier recheck occurred.
+
+## Fast check sampling improvement
+
+Newly issued rechecks are sampled every 500 ms for up to 20 seconds inside
+`repair_tracker.php --poll` to reduce the chance of missing the asynchronous
+`checking*` state. Sampling does **not** turn a previously failed job into a
+success and cannot prove completion by itself. The existing `failed` record
+must be reviewed; never edit `repair-tracking.json` to manufacture a verified
+state. If even high-frequency sampling misses checking, the job still fails
+closed, requiring a fresh controlled verification.
