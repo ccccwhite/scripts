@@ -292,10 +292,16 @@ function processOne(string $hash, array $t, array $cfg, array &$state, array $li
     if ($epoch < 1 || (int)($t['added_on'] ?? 0) < $epoch)
         fail('Not a new task created after activation_epoch');
     if (!hasNoContent($t)) {
-        // A user may manually start a torrent before the event watcher routes it.
-        // Never move live or partially downloaded data through the new-torrent path:
-        // recovery is a separate explicitly requested operation.
-        return 'REPAIR_REQUIRED: torrent has started/received data; run repair_existing.php after review';
+        // Immediately after the add event, qBit can expose a transient running
+        // state while metadata and queue state settle. No file is moved unless
+        // the task is STOPPED and no bytes have been downloaded.
+        // The watcher retries a fresh API snapshot quickly for new events.
+        $downloaded = (int)($t['downloaded'] ?? -1);
+        $progress = (float)($t['progress'] ?? 1);
+        if ($downloaded === 0 && $progress <= 0.0) {
+            return 'WAIT_TRANSIENT: zero downloaded but not stopped; retry soon';
+        }
+        return 'REPAIR_REQUIRED: data/progress detected; refuse path change';
     }
     $size = max((int)($t['size'] ?? 0), (int)($t['total_size'] ?? 0));
     if ($size <= 0) return 'waiting for torrent metadata/size';
