@@ -1,4 +1,0 @@
-#!/bin/bash
-set -euo pipefail
-BASE="/boot/config/plugins/user.scripts/pt-tracker-failover"
-exec /usr/bin/php "$BASE/pt_tracker_failover.php" "${1:---preview}" "$BASE/config.json"
