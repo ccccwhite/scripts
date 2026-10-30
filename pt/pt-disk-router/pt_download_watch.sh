@@ -76,6 +76,10 @@ while :; do
 
     # Process any events left across restarts or while the watcher was busy.
     run_pending
+    # Independent persistent post-move verification jobs; does not move data.
+    if [[ -f "$BASE/repair_tracker.php" && -f "$BASE/repair-tracking.json" ]]; then
+        /usr/bin/php "$BASE/repair_tracker.php" --poll || log "WARN: repair tracker poll failed"
+    fi
 
     # Event arrives quickly when on-add.sh creates a new hash file. A timeout
     # also allows later tag edits (which have no qBit on-add event) to retry.
