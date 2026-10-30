@@ -3,15 +3,48 @@ declare(strict_types=1);
 // SSD-only category path correction. Dry run unless --apply is set.
 // Never performs a hash check or a cross-device move.
 function failMove(string $m): never { throw new RuntimeException($m); }
+final class QbitRepair {
+    private string $url;
+    private string $cookie='';
+    public function __construct(array $c) {
+        $this->url=rtrim((string)($c['url']??''),'/');
+        if(!preg_match('~^https?://[a-zA-Z0-9.:-]+$~',$this->url)) failMove('Invalid qBit URL');
+        $r=$this->call('auth/login',[
+            'username'=>(string)($c['username']??$c['user']??''),
+            'password'=>(string)($c['password']??$c['pass']??'')
+        ],true);
+        if($r!=='' && $r!=='Ok.') failMove('qBit authentication failed');
+    }
+    public function call(string $ep,?array $post=null,bool $login=false): string {
+        $h=curl_init($this->url.'/api/v2/'.$ep);
+        if(!$h) failMove('curl_init failed');
+        $headers=['Origin: '.$this->url,'Referer: '.$this->url.'/'];
+        if($this->cookie!=='')$headers[]='Cookie: '.$this->cookie;
+        curl_setopt_array($h,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_CONNECTTIMEOUT=>5,
+            CURLOPT_TIMEOUT=>20,CURLOPT_PROXY=>'',CURLOPT_NOPROXY=>'*',
+            CURLOPT_HTTPHEADER=>$headers,CURLOPT_FOLLOWLOCATION=>false,
+            CURLOPT_HEADERFUNCTION=>function($ch,string $line):int{
+                if(preg_match('/^Set-Cookie:\\s*((?:SID|QBT_SID_[0-9]+)=[^;\\s]+)/i',$line,$m))
+                    $this->cookie=$m[1];
+                return strlen($line);
+            }]);
+        if($post!==null){curl_setopt($h,CURLOPT_POST,true);curl_setopt($h,CURLOPT_POSTFIELDS,http_build_query($post));}
+        $body=curl_exec($h);$status=(int)curl_getinfo($h,CURLINFO_HTTP_CODE);
+        $error=curl_error($h);curl_close($h);
+        if($body===false||!in_array($status,$login?[200,204]:($post===null?[200]:[200,204]),true))
+            failMove("qBit $ep HTTP $status: $error");
+        if(trim((string)$body)==='Fails.')failMove("qBit rejected $ep");
+        return (string)$body;
+    }
+    public function get(string $ep): array {
+        $v=json_decode($this->call($ep),true,512,JSON_THROW_ON_ERROR);
+        return is_array($v)?$v:[];
+    }
+}
 function api(string $ep, ?array $form=null): array|string {
-    $ch=curl_init('http://127.0.0.1:8080/api/v2/'.$ep);
-    curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_CONNECTTIMEOUT=>3,CURLOPT_TIMEOUT=>15,CURLOPT_PROXY=>'',CURLOPT_NOPROXY=>'*']);
-    if($form!==null){curl_setopt($ch,CURLOPT_POST,true);curl_setopt($ch,CURLOPT_POSTFIELDS,http_build_query($form));}
-    $body=curl_exec($ch);$code=curl_getinfo($ch,CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    if($body===false||!in_array($code,[200,204],true)||trim((string)$body)==='Fails.') failMove("API $ep rejected ($code)");
-    if($form!==null)return (string)$body;
-    $data=json_decode((string)$body,true);if(!is_array($data))failMove("API $ep returned non-JSON");return $data;
+    global $q;
+    if(!$q instanceof QbitRepair)failMove('qBit client not initialized');
+    return $form===null ? $q->get($ep) : $q->call($ep,$form);
 }
 function torrent(string $hash): array {
     foreach(api('torrents/info?filter=all') as $t)if(strtolower((string)($t['hash']??''))===$hash)return $t;
@@ -33,6 +66,9 @@ try{
     $mapped=false;
     foreach($mounts??[] as $m)if(($m['Destination']??'')==='/temp'&&($m['Source']??'')==='/mnt/download')$mapped=true;
     if(!$mapped)failMove('Unexpected Docker /temp mapping');
+    $cfg=json_decode((string)file_get_contents(__DIR__.'/config.json'),true,512,JSON_THROW_ON_ERROR);
+    $creds=json_decode((string)file_get_contents((string)$cfg['credentials_file']),true,512,JSON_THROW_ON_ERROR);
+    $q=new QbitRepair((array)($creds['qbittorrent']??$creds['qbit']??[]));
     $t=torrent($hash);
     $cat=(string)($t['category']??'');
     if(!preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/D',$cat))failMove('Invalid category');
