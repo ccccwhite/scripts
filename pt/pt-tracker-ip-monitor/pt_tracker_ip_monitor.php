@@ -160,23 +160,104 @@ function validHost(string $url): string {
     $h=strtolower(rtrim((string)($p['host']??''),'.'));
     return preg_match('/^[a-z0-9.-]+$/D',$h)?$h:'';
 }
+/**
+ * qBittorrent 5.2.4 / WebAPI 2.13+ exposes independent IPv4/IPv6/BTv1/BTv2
+ * announce endpoints. A failed endpoint is NOT a failed torrent announce if
+ * another endpoint for this hash+Tracker host is working.
+ */
+function qbitEndpointFamily(string $name): string {
+    if(preg_match('/\\bIPv6\\b/i',$name))return 'v6';
+    if(preg_match('/\\bIPv4\\b/i',$name))return 'v4';
+    if(preg_match('/\\[([0-9a-f:]+)\\]/i',$name,$m) &&
+       filter_var($m[1],FILTER_VALIDATE_IP,FILTER_FLAG_IPV6))return 'v6';
+    if(preg_match('/(?<![0-9.])((?:[0-9]{1,3}\\.){3}[0-9]{1,3})(?![0-9.])/',$name,$m) &&
+       filter_var($m[1],FILTER_VALIDATE_IP,FILTER_FLAG_IPV4))return 'v4';
+    return 'other';
+}
+function qbitTrackerEndpoints(array $tracker): array {
+    if(!empty($tracker['endpoints'])&&is_array($tracker['endpoints'])){
+        return array_values(array_filter($tracker['endpoints'],'is_array'));
+    }
+    // Backward-compatible fallback when endpoints aren't supplied by the API.
+    return [[
+        'name'=>'',
+        'bt_version'=>0,
+        'status'=>$tracker['status']??-1,
+        'msg'=>$tracker['msg']??'',
+        'next_announce'=>$tracker['next_announce']??0
+    ]];
+}
+/** Evaluate all Tracker rows for ONE torrent and ONE host, never per endpoint. */
+function qbitGroupStatus(array $rows): array {
+    $out=['verdict'=>'unknown','total'=>0,'network_failures'=>0,
+          'successes'=>0,'endpoints'=>[],'sample'=>null];
+    foreach($rows as $tracker){
+        $url=(string)($tracker['url']??'');
+        foreach(qbitTrackerEndpoints($tracker) as $endpoint){
+            $code=(int)($endpoint['status']??-1);
+            $message=(string)($endpoint['msg']??'');
+            $networkFail=($code===6)||($code===4&&hasNetError($message));
+            $family=qbitEndpointFamily((string)($endpoint['name']??''));
+            $ep=[
+                'url'=>$url,
+                'name'=>(string)($endpoint['name']??''),
+                'bt_version'=>(int)($endpoint['bt_version']??0),
+                'next_announce'=>(int)($endpoint['next_announce']??0),
+                'status'=>$code,'family'=>$family,
+                'network_fail'=>$networkFail
+            ];
+            $out['endpoints'][]=$ep;
+            $out['total']++;
+            if($code===2)$out['successes']++;
+            if($networkFail){
+                $out['network_failures']++;
+                if($out['sample']===null)$out['sample']=$ep;
+            }
+        }
+    }
+    if($out['successes']>0)$out['verdict']='ok';
+    elseif($out['total']>0&&$out['network_failures']===$out['total'])$out['verdict']='bad';
+    return $out;
+}
 function qbitAuditAll(Qbit $qb): array {
-    $out=[];
-    foreach($qb->get('torrents/info?filter=all') as $t) {
-        $hash=strtolower((string)($t['hash']??''));
+    $grouped=[];
+    foreach($qb->get('torrents/info?filter=all') as $torrent){
+        $hash=strtolower((string)($torrent['hash']??''));
         if(!preg_match('/^[a-f0-9]{40}$/D',$hash))continue;
-        foreach($qb->get('torrents/trackers?hash='.$hash) as $v) {
-            $host=validHost((string)($v['url']??''));
+        $state=(string)($torrent['state']??'');
+        // Stopped/paused entries can retain old error messages.
+        if(str_starts_with($state,'stopped')||str_starts_with($state,'paused'))continue;
+        foreach($qb->get('torrents/trackers?hash='.$hash) as $tracker){
+            $host=validHost((string)($tracker['url']??''));
             if($host==='')continue;
-            $out[$host]??=['ok'=>0,'bad'=>0,'unknown'=>0,'samples'=>[]];
-            if(str_starts_with((string)($t['state']??''),'stopped'))continue;
-            $code=(int)($v['status']??-1);
-            if($code===2)$out[$host]['ok']++;
-            elseif($code===4&&hasNetError((string)($v['msg']??''))){
-                $out[$host]['bad']++;
-                $out[$host]['samples'][]=['client'=>'qbit','hash'=>$hash,
-                    'baseline'=>(int)($v['next_announce']??0),'url'=>(string)$v['url']];
-            }else $out[$host]['unknown']++;
+            $grouped[$host][$hash][]=$tracker;
+        }
+    }
+    $out=[];
+    foreach($grouped as $host=>$torrents){
+        $out[$host]=['ok'=>0,'bad'=>0,'unknown'=>0,'samples'=>[],
+            'endpoint_stats'=>[
+                'v4_ok'=>0,'v4_netfail'=>0,
+                'v6_ok'=>0,'v6_netfail'=>0,
+                'other_ok'=>0,'other_netfail'=>0
+            ]];
+        foreach($torrents as $hash=>$rows){
+            $result=qbitGroupStatus($rows);
+            $verdict=$result['verdict'];
+            $out[$host][$verdict]++;
+            foreach($result['endpoints'] as $ep){
+                if($ep['status']===2)$out[$host]['endpoint_stats'][$ep['family'].'_ok']++;
+                if($ep['network_fail'])$out[$host]['endpoint_stats'][$ep['family'].'_netfail']++;
+            }
+            if($verdict==='bad'&&$result['sample']!==null){
+                $s=$result['sample'];
+                $out[$host]['samples'][]=[
+                    'client'=>'qbit','hash'=>$hash,'url'=>$s['url'],
+                    'endpoint_name'=>$s['name'],
+                    'endpoint_bt_version'=>$s['bt_version'],
+                    'baseline'=>$s['next_announce']
+                ];
+            }
         }
     }
     return $out;
@@ -280,15 +361,25 @@ function verifySamples(array $samples,Qbit $qb,Transmission $tr,string $host,int
         $result='pending';$started=(int)($s['started']??0);
         if($started>0 && time()-$started >= $settle){
             if($s['client']==='qbit'){
+                $rows=[];
                 foreach($qb->get('torrents/trackers?hash='.rawurlencode($s['hash'])) as $v){
-                    if(validHost((string)($v['url']??''))!==$host)continue;
-                    $fresh=(int)($v['next_announce']??0)>0 &&
-                           (int)($v['next_announce']??0)!==(int)($s['baseline']??0);
-                    $code=(int)($v['status']??-1);
-                    if($fresh&&$code===2)$result='ok';
-                    elseif($fresh&&$code===4&&hasNetError((string)($v['msg']??'')))$result='bad';
+                    if(validHost((string)($v['url']??''))===$host)$rows[]=$v;
+                }
+                $summary=qbitGroupStatus($rows);
+                // Confirm a fresh result from the very endpoint selected for
+                // reannounce. Other stale endpoint timers must not count.
+                $fresh=false;
+                foreach($summary['endpoints'] as $ep){
+                    if($ep['url']!==($s['url']??''))continue;
+                    if(isset($s['endpoint_name'])&&$ep['name']!==$s['endpoint_name'])continue;
+                    if(isset($s['endpoint_bt_version'])&&
+                       $ep['bt_version']!==(int)$s['endpoint_bt_version'])continue;
+                    $next=$ep['next_announce'];
+                    if($next>0&&$next!==(int)($s['baseline']??0))$fresh=true;
                     break;
                 }
+                if($fresh&&$summary['verdict']==='ok')$result='ok';
+                elseif($fresh&&$summary['verdict']==='bad')$result='bad';
             }else{
                 foreach(($map[$s['hash']]['tracker_stats']??[]) as $v){
                     if(validHost((string)($v['announce']??''))!==$host)continue;
@@ -463,7 +554,14 @@ try{
         $tv=$t[$host]??['ok'=>0,'bad'=>0,'unknown'=>0,'samples'=>[]];
         $bad=$qv['bad']+$tv['bad'];
         $entry=$state[$host]??['current_ip'=>'','last_switch'=>0,'last_probe'=>0,'samples'=>[]];
-        say($host.' qBit(ok='.$qv['ok'].' bad='.$qv['bad'].') trans(ok='.$tv['ok'].' bad='.$tv['bad'].' no_plan='.($tv['no_plan']??0).')');
+        say($host.' qBit(ok='.$qv['ok'].' bad='.$qv['bad'].' unknown='.$qv['unknown'].
+            ' torrents; endpoint IPv4(ok='.(int)($qv['endpoint_stats']['v4_ok']??0).
+            ' fail='.(int)($qv['endpoint_stats']['v4_netfail']??0).
+            ') IPv6(ok='.(int)($qv['endpoint_stats']['v6_ok']??0).
+            ' fail='.(int)($qv['endpoint_stats']['v6_netfail']??0).
+            ') other(ok='.(int)($qv['endpoint_stats']['other_ok']??0).
+            ' fail='.(int)($qv['endpoint_stats']['other_netfail']??0).
+            ')) trans(ok='.$tv['ok'].' bad='.$tv['bad'].' no_plan='.($tv['no_plan']??0).')');
         if(($tv['no_plan']??0)>0){
             say('ANNOUNCE_UNSCHEDULED '.$host.' count='.$tv['no_plan'].
                 ' hash_prefixes='.implode(',',(array)($tv['no_plan_hashes']??[])).
