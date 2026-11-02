@@ -190,8 +190,18 @@ function transAuditAll(Transmission $tr): array {
         foreach($rows as $v){$h=validHost((string)($v['announce']??''));if($h!=='')$hosts[$h]=true;}
         foreach($rows as $v){
             $host=validHost((string)($v['announce']??''));if($host==='')continue;
-            $out[$host]??=['ok'=>0,'bad'=>0,'unknown'=>0,'samples'=>[]];
-            if((int)($t['status']??0)===0)continue;
+            $out[$host]??=['ok'=>0,'bad'=>0,'unknown'=>0,'no_plan'=>0,'no_plan_hashes'=>[],'samples'=>[]];
+            if(!in_array((int)($t['status']??0),[4,6],true))continue;
+            if(($v['is_backup']??false)===true)continue;
+            // Scrape can succeed even with no Announce. Detect this separately
+            // from network errors so it never triggers Tracker IP failover.
+            if((int)($v['announce_state']??-1)===0 &&
+               (int)($v['next_announce_time']??-1)===0){
+                $out[$host]['no_plan']++;
+                $out[$host]['unknown']++;
+                $out[$host]['no_plan_hashes'][]=substr($hash,0,12);
+                continue;
+            }
             if(!($v['has_announced']??false)){$out[$host]['unknown']++;continue;}
             if(($v['last_announce_succeeded']??false)===true)$out[$host]['ok']++;
             elseif(($v['last_announce_timed_out']??false)===true||
@@ -453,7 +463,12 @@ try{
         $tv=$t[$host]??['ok'=>0,'bad'=>0,'unknown'=>0,'samples'=>[]];
         $bad=$qv['bad']+$tv['bad'];
         $entry=$state[$host]??['current_ip'=>'','last_switch'=>0,'last_probe'=>0,'samples'=>[]];
-        say($host.' qBit(ok='.$qv['ok'].' bad='.$qv['bad'].') trans(ok='.$tv['ok'].' bad='.$tv['bad'].')');
+        say($host.' qBit(ok='.$qv['ok'].' bad='.$qv['bad'].') trans(ok='.$tv['ok'].' bad='.$tv['bad'].' no_plan='.($tv['no_plan']??0).')');
+        if(($tv['no_plan']??0)>0){
+            say('ANNOUNCE_UNSCHEDULED '.$host.' count='.$tv['no_plan'].
+                ' hash_prefixes='.implode(',',(array)($tv['no_plan_hashes']??[])).
+                ' (not an IP failure; no forced reannounce)');
+        }
         if(($entry['current_ip']??'')!==''){
             syncHosts($containers,$host,(string)$entry['current_ip'],$apply);
             if(!isset($entry['post_ip']) && (int)($entry['last_switch']??0)>0){
