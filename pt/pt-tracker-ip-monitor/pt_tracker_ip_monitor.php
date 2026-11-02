@@ -221,13 +221,20 @@ function qbitGroupStatus(array $rows): array {
 }
 function qbitAuditAll(Qbit $qb): array {
     $grouped=[];
-    foreach($qb->get('torrents/info?filter=all') as $torrent){
+    // Fetch all Tracker endpoints in ONE qBittorrent 5.2.4 snapshot.
+    // Thousands of per-hash reads can span different announce cycles,
+    // producing internally inconsistent per-torrent health statistics.
+    $torrents=$qb->get('torrents/info?filter=all&includeTrackers=true');
+    foreach($torrents as $torrent){
         $hash=strtolower((string)($torrent['hash']??''));
         if(!preg_match('/^[a-f0-9]{40}$/D',$hash))continue;
         $state=(string)($torrent['state']??'');
         // Stopped/paused entries can retain old error messages.
         if(str_starts_with($state,'stopped')||str_starts_with($state,'paused'))continue;
-        foreach($qb->get('torrents/trackers?hash='.$hash) as $tracker){
+        if(!isset($torrent['trackers'])||!is_array($torrent['trackers']))
+            throw new RuntimeException('qBit includeTrackers response missing trackers');
+        foreach($torrent['trackers'] as $tracker){
+            if(!is_array($tracker))continue;
             $host=validHost((string)($tracker['url']??''));
             if($host==='')continue;
             $grouped[$host][$hash][]=$tracker;
