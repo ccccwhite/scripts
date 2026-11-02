@@ -58,6 +58,53 @@ function trackerLines(string $list): array {
     return preg_split('/(\r\n|\n|\r)/', $list, -1, PREG_SPLIT_DELIM_CAPTURE);
 }
 
+
+/**
+ * Repair a missing Transmission Announce schedule only after this script
+ * actually changes a torrent's Tracker list. No bulk or periodic announces.
+ */
+function recoverTransAnnounceAfterEdit(array $tr,string $hash,string &$session): void {
+    $read=static function()use($tr,$hash,&$session):array{
+        $r=rpc($tr,'torrent_get',[
+            'ids'=>[$hash],
+            'fields'=>['status','tracker_stats']
+        ],$session);
+        return $r['torrents'][0]??[];
+    };
+    $torrent=$read();
+    if(!in_array((int)($torrent['status']??0),[4,6],true))return;
+    foreach(($torrent['tracker_stats']??[]) as $st){
+        if(($st['is_backup']??false)===true)continue;
+        $host=strtolower((string)(parse_url((string)($st['announce']??''),PHP_URL_HOST)?:''));
+        if($host!=='tra99.manfuz.co')continue;
+        $inactive=(int)($st['announce_state']??-1)===0;
+        $noNext=(int)($st['next_announce_time']??-1)===0;
+        if(!$inactive||!$noNext){
+            echo 'Trans '.substr($hash,0,12)." Announce schedule OK\n";
+            return;
+        }
+        echo 'Trans '.substr($hash,0,12)." Announce unscheduled after tracker edit; requesting once\n";
+        rpc($tr,'torrent_reannounce',['ids'=>[$hash]],$session);
+        sleep(3);
+        $after=$read();
+        foreach(($after['tracker_stats']??[]) as $new){
+            if(($new['is_backup']??false)===true)continue;
+            $h=strtolower((string)(parse_url((string)($new['announce']??''),PHP_URL_HOST)?:''));
+            if($h!=='tra99.manfuz.co')continue;
+            $ready=(int)($new['announce_state']??0)!==0 ||
+                   (int)($new['next_announce_time']??0)>0 ||
+                   ($new['has_announced']??false)===true;
+            echo $ready
+                ? 'Trans '.substr($hash,0,12)." Announce resumed\n"
+                : 'Trans '.substr($hash,0,12)." WARNING: still unscheduled; inspect manually\n";
+            return;
+        }
+        echo 'Trans '.substr($hash,0,12)." WARNING: tracker missing after edit\n";
+        return;
+    }
+    echo 'Trans '.substr($hash,0,12)." WARNING: M-Team tracker missing after edit\n";
+}
+
 $apply=in_array('--apply',$argv,true);
 $preview=in_array('--preview',$argv,true);
 if ($apply && $preview) {fwrite(STDERR,"Choose one mode\n");exit(1);}
@@ -149,6 +196,7 @@ try {
             $stats['trans']['changed']++;
             echo 'Trans '.substr($hash,0,12)." UPDATED\n";
             sleep(10);
+            recoverTransAnnounceAfterEdit($tr,$hash,$session);
         } catch(Throwable $e) {
             $stats['trans']['failed']++;
             echo 'Trans '.substr($hash,0,12).' FAILED (review client/API status; no secrets printed)'."\n";
@@ -159,4 +207,4 @@ try {
 }
 foreach($stats as $name=>$v)echo $name.' eligible='.$v['eligible'].' changed='.$v['changed']
     .' skipped='.$v['skipped'].' failed='.$v['failed']."\n";
-echo "No forced reannounce, file moves, deletions or proxy changes.\n";
+echo "Only conditional post-edit reannounce; no file moves, deletions or proxy changes.\n";
