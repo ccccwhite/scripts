@@ -241,7 +241,10 @@ function destinationRoot(array $entry,array $cfg): string {
     if(isset($entry['hdd_path'])&&absolutePath($entry['hdd_path'])!==$hdd)
         throw new RuntimeException('Container HDD mapping changed during pending migration');
     $relative=substr($dest,strlen($hdd)+1);
-    if(!preg_match('/^[a-zA-Z0-9_-]+$/',$relative))throw new RuntimeException('Unsafe site folder');
+    // New migrations go to /hdd/qbit/<site>. Still accept historic /hdd/<site>
+    // for pending entries written before the folder layout was changed.
+    if(!preg_match('~^(?:qbit/)?[a-zA-Z0-9_-]+$~D',$relative))
+        throw new RuntimeException('Unsafe destination folder');
     return safeHostPath($cfg['hdd_host_path'],$relative);
 }
 function assertMounted(array $cfg): void {
@@ -277,16 +280,20 @@ function preflightDestination(array $t,array $entry,array $cfg): void {
     }
     clearstatcache();$free=disk_free_space($cfg['hdd_host_path']);
     if($free===false||$free<$bytes+($cfg['_reserved_bytes']??0)+max(1073741824,(int)ceil($bytes*0.05)))throw new RuntimeException('Insufficient HDD free space');
-    // Set ownership for site directories created by the root-run migration script.
-    $created=false;
-    if(!is_dir($root)){
-        if(!mkdir($root,0775,true)&&!is_dir($root))
-            throw new RuntimeException('Cannot create site directory');
-        $created=true;
-    }
-    if($created){
-        if(!chown($root,99)||!chgrp($root,100)||!chmod($root,0775))
-            throw new RuntimeException('Cannot set Transmission directory ownership');
+    // Create each missing level separately. A recursive mkdir would create
+    // /hdd/qbit owned by root, preventing Transmission (99:100) from writing.
+    $hddHost=absolutePath($cfg['hdd_host_path']);
+    $relative=substr($root,strlen($hddHost)+1);
+    $cursor=$hddHost;
+    foreach(explode('/',$relative) as $part){
+        $cursor=safeHostPath($cursor,$part);
+        if(is_dir($cursor))continue; // Never change ownership of existing directories.
+        if(file_exists($cursor)||is_link($cursor))
+            throw new RuntimeException('Destination component is not a directory: '.$cursor);
+        if(!mkdir($cursor,0775))
+            throw new RuntimeException('Cannot create destination directory: '.$cursor);
+        if(!chown($cursor,99)||!chgrp($cursor,100)||!chmod($cursor,0775))
+            throw new RuntimeException('Cannot set Transmission directory ownership: '.$cursor);
     }
     destinationRoot($entry,$cfg);
 }
@@ -742,7 +749,7 @@ try {
             // Explicitly keep actual moves disabled unless both switches are changed.
             $folder=$cfg['site_folder_case']==='lower'?strtolower($site):$site;
             if(!preg_match('/^[a-zA-Z0-9_-]+$/',$folder)) {say('SKIP '.$hash.' unsafe site folder');continue;}
-            $dest=norm($hdd.'/'.$folder);
+            $dest=norm($hdd.'/qbit/'.$folder);
             say(($dry||!$moveEnabled?'PREVIEW MOVE':'MOVE').' '.substr($hash,0,12).' '.$name.' '.$dir.' -> '.$dest);
             if($dry||!$moveEnabled)continue;
             // Refresh both clients immediately before accepting a move.
